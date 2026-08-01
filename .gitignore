@@ -1,0 +1,4 @@
+secrets.h
+*.local
+.DS_Store
+logs
