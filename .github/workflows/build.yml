@@ -30,7 +30,11 @@ jobs:
           arduino-cli lib install "Adafruit GFX Library@1.12.6"
 
       - name: Compile secret-free ESP32-S3 build
-        run: >-
-          arduino-cli compile
-          --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,USBMode=hwcdc,CDCOnBoot=cdc
-          .
+        run: |
+          # Arduino requires a sketch directory named after its main .ino file.
+          # GitHub checks out this repository as "flight-above-head", so compile
+          # an isolated copy with the required FlightAboveHead directory name.
+          cp -a . /tmp/FlightAboveHead
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,USBMode=hwcdc,CDCOnBoot=cdc \
+            /tmp/FlightAboveHead
