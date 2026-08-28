@@ -7,12 +7,12 @@
   <img src="https://img.shields.io/badge/target-ESP32--S3-0b6bcb?logo=espressif&logoColor=white" alt="ESP32-S3 target">
   <img src="https://img.shields.io/badge/Arduino--ESP32-3.3.11-00979d?logo=arduino&logoColor=white" alt="Arduino ESP32 3.3.11">
   <img src="https://img.shields.io/badge/display-HUB75E-ffb547" alt="HUB75E display">
-  <img src="https://img.shields.io/badge/license-not%20selected-6b7280" alt="License not selected">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-6b4fbb" alt="Apache-2.0 license"></a>
 </p>
 
-<p align="center"><strong>A desk display for live overhead aircraft, regional alerts, weather, and time on a 128×64 HUB75E panel.</strong></p>
+<p align="center"><strong>A decorative interior display with ambient scenes, live overhead aircraft, Israeli rocket alerts, weather, and time on a 128×64 HUB75E panel.</strong></p>
 
-Flight Above Head is an ESP32-S3 firmware project for a fixed installation. It keeps the display quiet at cold boot, presents the highest-priority live signal first, and leaves private Wi-Fi credentials and coordinates outside Git.
+Flight Above Head is an ESP32-S3 firmware project for a fixed installation. Most of the time it behaves as a calm ambient object with changeable screensavers; when an aircraft or regional rocket alert appears, the live signal takes priority. Private Wi-Fi credentials and coordinates stay outside Git.
 
 > This is a safety-adjacent information display, not a certified emergency-warning device. Do not rely on it as the sole source of civil-defense or aviation information.
 
@@ -21,7 +21,7 @@ Flight Above Head is an ESP32-S3 firmware project for a fixed installation. It k
 | Capability | Behavior |
 | --- | --- |
 | Live airspace | Polls the configured AirPlaneTracker service and prioritizes a current aircraft card. |
-| Regional alerts | Alert state always overrides aircraft and selected UI screens. |
+| Israeli rocket alerts | Regional alert state always overrides aircraft and selected UI screens. |
 | Ambient display | Includes time, weather, forecast, daylight-aware themes, fourteen screensavers, and BH1750 brightness control. |
 | Resilience | Retains last-good data, bounded retries, diagnostics, reset recovery, and a blank cold-start panel. |
 | Privacy boundary | Real `secrets.h` and `location.h` are ignored; tracked `.example` templates document the required format. |
@@ -132,6 +132,7 @@ assets/                      Repository brand assets
 docs/                        Architecture, wiring, API notes, troubleshooting
 tests/                       Host-side regression checks
 .github/workflows/build.yml  Secret-free ESP32-S3 CI compile
+NOTICE                       Required attribution notice for redistributions
 ```
 
 ## Documentation
@@ -160,7 +161,14 @@ Issues and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.
 
 ## License
 
-No open-source license has been selected. Copyright remains with the author; public visibility alone does not grant reuse rights. A license will be added only after the owner selects one.
+This project is licensed under [Apache License 2.0](LICENSE): you may use,
+modify, and redistribute it, including as a starting point for another project.
+When redistributing the work or a derivative, retain the attribution notice in
+[NOTICE](NOTICE), which credits [Yinon Mitin](https://github.com/yinon-mitin)
+and links to the original [Flight Above Head project](https://github.com/yinon-mitin/flight-above-head).
+
+The project is provided without warranty. Third-party dependencies and services
+retain their own licenses and terms.
 
 ## Third-party software and services
 

@@ -6,6 +6,10 @@ All notable changes to Flight Above Head are documented here.
 
 ### Added
 
+- Added a new interior-display project mark that depicts ambient screensavers,
+  live aircraft, and rocket-alert priority.
+- Adopted Apache License 2.0 with a redistribution NOTICE that credits Yinon
+  Mitin and links to the original Flight Above Head project.
 - Added live-aircraft acknowledgement: a double touch on the live flight card
   returns to the selected screensaver without suppressing a later aircraft.
 - Added publication-ready English setup, deployment, GPIO, compatible-hardware,

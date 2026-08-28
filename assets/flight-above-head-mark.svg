@@ -1,37 +1,63 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 520" role="img" aria-labelledby="title desc">
   <title id="title">Flight Above Head</title>
-  <desc id="desc">An amber aircraft orbiting a radar display above the Flight Above Head wordmark.</desc>
+  <desc id="desc">A luminous interior display cycles through ambient, aircraft, and missile alert scenes.</desc>
   <defs>
-    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#07121f"/>
-      <stop offset="1" stop-color="#112a42"/>
+    <linearGradient id="room" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111e"/>
+      <stop offset=".55" stop-color="#102a3d"/>
+      <stop offset="1" stop-color="#25131c"/>
     </linearGradient>
-    <linearGradient id="trail" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#1ed7c6" stop-opacity="0"/>
-      <stop offset="1" stop-color="#1ed7c6"/>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16334a"/>
+      <stop offset="1" stop-color="#071521"/>
     </linearGradient>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="5" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#20cdbf"/>
+      <stop offset="1" stop-color="#ffb547"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-40%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="18" stdDeviation="16" flood-color="#000" flood-opacity=".5"/>
     </filter>
+    <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="pixels" width="10" height="10" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#77dce0" opacity=".16"/>
+    </pattern>
   </defs>
-  <rect width="1200" height="360" rx="30" fill="url(#sky)"/>
-  <g transform="translate(180 180)" fill="none" stroke="#1ed7c6" opacity=".48">
-    <circle r="128" stroke-width="2"/>
-    <circle r="88" stroke-width="2"/>
-    <circle r="48" stroke-width="2"/>
-    <path d="M-142 0H142M0-142V142" stroke-width="1"/>
-    <path d="M-104-104L104 104M104-104L-104 104" stroke-width="1"/>
+  <rect width="1440" height="520" rx="32" fill="url(#room)"/>
+  <path d="M0 425H1440" stroke="#34536b" stroke-width="2" opacity=".45"/>
+  <path d="M0 476H1440" stroke="#34536b" stroke-width="2" opacity=".25"/>
+  <g filter="url(#shadow)">
+    <rect x="90" y="72" width="600" height="350" rx="24" fill="#03090f" stroke="#2c5066" stroke-width="5"/>
+    <rect x="112" y="94" width="556" height="306" rx="12" fill="url(#panel)"/>
+    <rect x="112" y="94" width="556" height="306" rx="12" fill="url(#pixels)"/>
+    <!-- ambient screensaver quadrant -->
+    <path d="M142 300C198 206 254 344 310 250S422 343 478 220S590 314 638 174" fill="none" stroke="url(#sunset)" stroke-width="6" stroke-linecap="round" opacity=".88"/>
+    <circle cx="184" cy="176" r="42" fill="none" stroke="#29d8ce" stroke-width="2" opacity=".48"/>
+    <circle cx="184" cy="176" r="22" fill="none" stroke="#29d8ce" stroke-width="2" opacity=".55"/>
+    <path d="M134 176H234M184 126V226" stroke="#29d8ce" opacity=".35"/>
+    <!-- live aircraft -->
+    <g transform="translate(440 195) rotate(18)" filter="url(#glow)">
+      <path d="M0-54L12-11 75 17 75 31 12 23 5 61H-7L-14 23-77 31V17L-14-11-2-54Z" fill="#f6fbff"/>
+      <path d="M-2-39L4-9 52 13-2 5-55 13-8-9Z" fill="#ffb547"/>
+    </g>
+    <path d="M332 165C362 144 389 142 416 157" fill="none" stroke="#ffb547" stroke-width="3" stroke-dasharray="5 8" opacity=".8"/>
+    <!-- alert trajectory -->
+    <path d="M600 338C596 280 577 243 546 205" fill="none" stroke="#ff5c6a" stroke-width="4" stroke-dasharray="7 7" filter="url(#glow)"/>
+    <g transform="translate(546 205) rotate(-35)" filter="url(#glow)">
+      <path d="M0-26L8 15H-8Z" fill="#ff5c6a"/>
+      <path d="M-8 11L-18 23H18L8 11Z" fill="#ffb547"/>
+    </g>
+    <rect x="528" y="325" width="112" height="38" rx="19" fill="#722534" stroke="#ff5c6a" stroke-width="2"/>
+    <text x="584" y="350" text-anchor="middle" fill="#fff3f4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">ALERT</text>
   </g>
-  <path d="M40 180C95 114 151 102 248 130" fill="none" stroke="url(#trail)" stroke-width="6" stroke-linecap="round"/>
-  <g transform="translate(234 126) rotate(22)" filter="url(#glow)">
-    <path d="M0-58L12-10 74 16 74 29 11 22 5 61-8 61-14 22-76 29-76 16-14-10-2-58Z" fill="#ffb547"/>
-    <path d="M-2-44L4-11 53 12-2 4-57 12-8-11Z" fill="#fff3d1" opacity=".9"/>
-  </g>
-  <g transform="translate(390 0)">
-    <text x="0" y="158" fill="#f6fbff" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="76" font-weight="800" letter-spacing="-2">FLIGHT</text>
-    <text x="0" y="230" fill="#a9c4d9" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="50" font-weight="600" letter-spacing="12">ABOVE HEAD</text>
-    <rect x="2" y="257" width="400" height="3" rx="2" fill="#1ed7c6"/>
-    <text x="0" y="304" fill="#7f9db4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="2">ESP32-S3 · HUB75 · LIVE AIRSPACE</text>
+  <g transform="translate(770 0)">
+    <text x="0" y="186" fill="#f6fbff" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="94" font-weight="850" letter-spacing="-3">FLIGHT</text>
+    <text x="3" y="268" fill="#b8d1dd" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="58" font-weight="650" letter-spacing="14">ABOVE HEAD</text>
+    <rect x="3" y="296" width="530" height="4" rx="2" fill="url(#sunset)"/>
+    <text x="4" y="348" fill="#8ba9bb" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" letter-spacing="2">AMBIENT DISPLAY · AIRCRAFT · ALERTS</text>
+    <text x="4" y="385" fill="#5e8299" font-family="ui-sans-serif, system-ui, sans-serif" font-size="20">A decorative interior object that becomes live when it matters.</text>
   </g>
 </svg>
