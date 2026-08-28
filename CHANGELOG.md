@@ -2,6 +2,104 @@
 
 All notable changes to Flight Above Head are documented here.
 
+## Unreleased
+
+### Added
+
+- Added live-aircraft acknowledgement: a double touch on the live flight card
+  returns to the selected screensaver without suppressing a later aircraft.
+- Added publication-ready English setup, deployment, GPIO, compatible-hardware,
+  power, Serial console, diagnostics, privacy, and maintenance documentation.
+- Added a detailed troubleshooting guide, pre-release privacy/validation
+  checklist, and a pinned secret-free GitHub Actions Arduino build.
+- Added a tracked `location.example.h` template while keeping real installation
+  coordinates in ignored local configuration.
+- Added a fourteenth compact weather-forecast screen with current/apparent and
+  daily min/max temperature, current UV, maximum wind/direction, sunrise, and
+  sunset.
+- Added a persistent NVS boot counter and non-wrapping 64-bit uptime to boot
+  and runtime diagnostics.
+- Added reset-cause diagnostics plus RTC-retained loop/network/render
+  heartbeats and approximate previous-session uptime.
+- Added a calm rotating perspective square-pyramid screensaver.
+- Added lightweight subpixel line coverage for smoother slow wireframe motion
+  without FastLED, GFX_Lite, or an additional framebuffer.
+- Added a minimal clock-and-date screensaver matching the original idle layout;
+  its only animation is the subtle one-second colon breath.
+
+### Changed
+
+- Increased the live-aircraft arrival transition to a dedicated 16 ms target
+  cadence with longer eased stages for more intermediate frames and smoother
+  canvas fill, fly-through, and reveal motion.
+
+### Fixed
+
+- Restored a clearly visible, larger top-view aircraft silhouette in the live
+  arrival transition and replaced its directional canvas wipe with a fast,
+  full-panel ordered-dither fade-in.
+- Fixed double-touch navigation after acknowledging a live aircraft: while its
+  API entry remains active, a double touch on a screensaver now opens Last
+  Aircraft instead of redundantly acknowledging the hidden flight again.
+- Removed the second screensaver's minute-boundary wave jump. Its phase is now
+  integrated continuously, while daytime wavelength, speed, and amplitude
+  ease toward their targets over 45 seconds.
+- Centered the complete current-condition and sunrise/sunset groups on the
+  fourteenth compact forecast screen.
+- Consolidated Open-Meteo weather, forecast, and solar data into one request
+  aligned to each 15-minute model slot (about 96 calls/day normally), with a
+  bounded 2/4/8/15-minute retry backoff and explicit real-call diagnostics.
+- Replaced the text-heavy fourteenth forecast layout with a compact icon grid
+  for conditions, current/apparent and min/max temperature, UV, directed wind,
+  sunrise, and sunset; only the measured values remain as text.
+- Changed the forecast UV value from the day's maximum to Open-Meteo's current
+  `uv_index`, refreshed with the current-condition snapshot throughout the day.
+- Moved the best-effort network worker to FreeRTOS idle priority. Long TLS or
+  HTTP waits now share Core 0 with `IDLE0` instead of starving the five-second
+  task watchdog, while the existing longer Alerts timeout remains available
+  for slow but valid responses.
+- Reassigned the former split-canvas startup reveal to live-aircraft arrival:
+  the current screen is covered, a top-view aircraft cuts the canvas, and the
+  flight card is revealed beneath it. Panel startup now uses a restrained
+  perspective-runway takeoff with a circular dithered screensaver reveal.
+- Grouped each periodic Serial Monitor diagnostic snapshot between visible
+  dividers and added category labels for faster scanning.
+- Removed the periodic standalone `wifi=ok` line; steady Wi-Fi/IP/RSSI state is
+  now reported once in `[diag][SYSTEM]`, while `[network]` is reserved for
+  connection transitions and retry activity.
+- Classified HTTP/API failures under `[error]` instead of the misleading
+  `[network]` prefix, increased the flight-request timeout to five seconds and
+  the slower alert-proxy timeout to twelve seconds, and spaced alert/flight
+  polls from completion so a timeout cannot cause an immediate retry burst.
+- Centered the complete `LAST AIRCRAFT` information block on the 128x64 panel.
+
+### Removed
+
+- Removed the former screensavers 5, 13, and 15 (gravity rings, abstract
+  contours, and the 4D tesseract) and compacted the remaining selection to
+  thirteen effects.
+
+### Fixed
+
+- Removed the conflicting Open-Meteo `current_weather=true` legacy switch.
+  The API now returns and the firmware strictly parses distinct
+  `temperature_2m` and `apparent_temperature` values instead of silently
+  copying current temperature into the missing feels-like field.
+- Made all four edges of the live-aircraft card use one continuous amber
+  border in NIGHT/SLEEP mode, including pixels beneath service indicators.
+- Preserved an armed panel across software, panic, watchdog, brownout, and
+  reset-button restarts so a transient controller reset no longer leaves the
+  24/7 display waiting indefinitely for another touch. Cold power-on standby
+  and explicit `panel off` remain unchanged.
+- Corrected FreeRTOS stack high-water diagnostics to report ESP-IDF byte units
+  without multiplying by `StackType_t`, and increased the render-task stack
+  from 8 KiB to 12 KiB.
+- Reworked the minute-sector clock's `59:59 → 00:00` rollback to use the NTP
+  wall-clock fraction and cosine easing directly, eliminating opposing
+  transition restarts and angular jumps. The softly feathered edge now moves
+  explicitly counterclockwise at roughly 60 fps and reaches a fully empty
+  background at minute `00`, including when this saver opens during `59:59`.
+
 ## v1.0 — 2026-08-01
 
 First hardware-tested ESP32-S3/HUB75 release.

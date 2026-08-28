@@ -1,4 +1,9 @@
 secrets.h
+location.h
 *.local
 .DS_Store
 logs
+build/
+*.bin
+*.elf
+*.map

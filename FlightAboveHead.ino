@@ -9,11 +9,15 @@
 #include <Fonts/TomThumb.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_attr.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include "api_config.h"
+#include "open_meteo_ca.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -76,15 +80,22 @@ constexpr uint32_t ALERT_POLL_MS = 3000;
 constexpr uint32_t FLIGHT_POLL_MS = 5000;
 constexpr uint32_t HISTORY_REFRESH_MS = 5UL * 60UL * 1000UL;
 constexpr uint32_t HISTORY_RETRY_MS = 30UL * 1000UL;
-constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
-constexpr uint32_t WEATHER_RETRY_MS = 60UL * 1000UL;
-constexpr uint32_t SOLAR_REFRESH_MS = 6UL * 60UL * 60UL * 1000UL;
-constexpr uint32_t SOLAR_RETRY_MS = 10UL * 60UL * 1000UL;
+// Open-Meteo current conditions use 15-minute model slots. One bundled
+// current+daily request per slot keeps the display fresh without repeatedly
+// downloading identical data. A short grace period lets the new slot settle.
+constexpr uint32_t WEATHER_REFRESH_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t WEATHER_SLOT_GRACE_MS = 30UL * 1000UL;
+constexpr uint32_t WEATHER_RETRY_INITIAL_MS = 2UL * 60UL * 1000UL;
+constexpr uint32_t WEATHER_RETRY_MAX_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t NETWORK_STATUS_MS = 1000;
 constexpr uint32_t DIAGNOSTICS_MS = 5000;
 constexpr uint32_t FLIGHT_TTL_MS = 45000;
 constexpr uint32_t ALERT_TTL_MS = 15000;
-constexpr uint16_t HTTP_TIMEOUT_MS = 2500;
+constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
+// The alert proxy can legitimately spend more than five seconds establishing
+// TLS and waiting for its upstream source. Keep this endpoint-specific so a
+// slow alert response does not relax the timeout for frequent flight polls.
+constexpr uint16_t ALERT_HTTP_TIMEOUT_MS = 12000;
 constexpr uint16_t HISTORY_HTTP_TIMEOUT_MS = 10000;
 constexpr uint16_t EXTERNAL_HTTP_TIMEOUT_MS = 9000;
 constexpr uint8_t STATUS_FAILURE_THRESHOLD = 3;
@@ -115,10 +126,15 @@ constexpr uint32_t BUTTON_LONG_PRESS_MS = 800;
 constexpr uint32_t HARDWARE_TEST_SCREEN_MS = 8000;
 constexpr uint32_t IDLE_BREATH_FRAME_MS = 40;
 constexpr uint32_t SCREENSAVER_FRAME_MS = 25;
-constexpr uint8_t SCREENSAVER_COUNT = 12;
-constexpr uint32_t BOOT_INTRO_DURATION_MS = 2400;
-constexpr uint32_t AIRCRAFT_TRANSITION_DURATION_MS = 820;
-constexpr uint32_t AIRCRAFT_TRANSITION_FLYBY_MS = 320;
+// Live-aircraft arrival has its own faster cadence. Keeping it independent
+// prevents the 40 fps screensaver budget from quantizing the reveal.
+constexpr uint32_t AIRCRAFT_TRANSITION_FRAME_MS = 16;
+constexpr uint8_t SCREENSAVER_COUNT = 14;
+constexpr uint8_t UI_SAVER_SCHEMA_VERSION = 2;
+constexpr uint32_t BOOT_INTRO_DURATION_MS = 1900;
+constexpr uint32_t AIRCRAFT_TRANSITION_DURATION_MS = 2100;
+constexpr uint32_t AIRCRAFT_TRANSITION_FILL_MS = 240;
+constexpr uint32_t AIRCRAFT_TRANSITION_CUT_MS = 900;
 
 // Fallback brightness when the sensor is absent.
 constexpr uint8_t IDLE_BRIGHTNESS = 24;
@@ -162,11 +178,16 @@ enum class PanelColorOrder : uint8_t {
 constexpr PanelColorOrder PANEL_COLOR_ORDER = PanelColorOrder::BRG;
 
 constexpr uint32_t NETWORK_TASK_STACK = 16 * 1024;
-constexpr uint32_t RENDER_TASK_STACK = 8 * 1024;
-constexpr UBaseType_t NETWORK_TASK_PRIORITY = 1;
+constexpr uint32_t RENDER_TASK_STACK = 12 * 1024;
+// HTTPS calls can legitimately remain inside WiFiClientSecure for longer than
+// the five-second Core 0 idle-task watchdog window.  Run the best-effort
+// network worker at idle priority: FreeRTOS time slicing still advances it,
+// while IDLE0 always receives time to feed the task watchdog.
+constexpr UBaseType_t NETWORK_TASK_PRIORITY = tskIDLE_PRIORITY;
 constexpr UBaseType_t RENDER_TASK_PRIORITY = 2;
 constexpr BaseType_t NETWORK_TASK_CORE = 0;
 constexpr BaseType_t RENDER_TASK_CORE = 1;
+constexpr uint32_t RTC_RECOVERY_MAGIC = 0x46414831UL;  // "FAH1"
 
 // =========================
 // Data model
@@ -251,9 +272,18 @@ struct ApiStatus {
 
 struct WeatherData {
   bool valid = false;
+  bool forecastValid = false;
   bool lastFetchOk = false;
   float temperatureC = NAN;
   float feelsLikeC = NAN;
+  float minimumC = NAN;
+  float maximumC = NAN;
+  float uvIndexCurrent = NAN;
+  float windMaxKph = NAN;
+  uint16_t windDirectionDeg = 0;
+  uint16_t sunriseMin = FALLBACK_SUNRISE_MIN;
+  uint16_t sunsetMin = FALLBACK_SUNSET_MIN;
+  uint8_t weatherCode = 255;
   char observedAt[24] = "";
   uint32_t receivedMs = 0;
 };
@@ -282,6 +312,11 @@ struct PeripheralStatus {
   bool screensaverActive = false;
   uint8_t screensaverIndex = 0;
   bool lastAircraftView = false;
+  // A double tap may acknowledge only the flight currently on screen. The
+  // marker is cleared by the next successful empty live response, and a
+  // different identity always regains normal live-aircraft priority.
+  char dismissedFlightId[16] = "";
+  char dismissedFlightCallsign[16] = "";
   VisualMode visualMode = VisualMode::DAY;
   NightOverride nightOverride = NightOverride::AUTO;
   ScreenOverride screenOverride = ScreenOverride::AUTO;
@@ -297,6 +332,10 @@ struct RuntimeMetrics {
   uint32_t historyFailures = 0;
   uint32_t weatherRequests = 0;
   uint32_t weatherFailures = 0;
+  // Actual Open-Meteo HTTP calls. Solar and weather logical counters share
+  // this one bundled request and must not be added together for rate limits.
+  uint32_t openMeteoRequests = 0;
+  uint32_t openMeteoFailures = 0;
   uint32_t lastAlertDurationMs = 0;
   uint32_t lastFlightDurationMs = 0;
   uint32_t lastSolarDurationMs = 0;
@@ -313,6 +352,14 @@ struct RuntimeMetrics {
   uint8_t appliedBrightness = IDLE_BRIGHTNESS;
 };
 
+struct SaverVertex3 {
+  float x;
+  float y;
+  float z;
+  float screenX;
+  float screenY;
+};
+
 struct SharedState {
   FlightData flight;
   FlightData lastAircraft;
@@ -326,6 +373,7 @@ struct SharedState {
 
 SharedState sharedState;
 SemaphoreHandle_t stateMutex = nullptr;
+extern TaskHandle_t loopTaskHandle;
 TaskHandle_t networkTaskHandle = nullptr;
 TaskHandle_t renderTaskHandle = nullptr;
 
@@ -358,7 +406,24 @@ Preferences uiPreferences;
 bool uiPreferencesReady = false;
 uint8_t persistedUiMode = 0xFF;
 uint8_t persistedScreensaverIndex = 0xFF;
+uint32_t persistentBootCount = 0;
+bool bootCounterPersistent = false;
 uint32_t bootIntroStartedMs = 0;
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+bool panelResumeAfterReset = false;
+uint32_t previousMainHeartbeatMs = 0;
+uint32_t previousNetworkHeartbeatMs = 0;
+uint32_t previousRenderHeartbeatMs = 0;
+uint32_t previousSessionUptimeSeconds = 0;
+
+// RTC no-init memory survives software, panic, watchdog, and reset-button
+// restarts without wearing flash. A magic value rejects uninitialized data
+// after a real power-on.
+RTC_NOINIT_ATTR volatile uint32_t rtcRecoveryMagic;
+RTC_NOINIT_ATTR volatile uint32_t rtcPanelArmed;
+RTC_NOINIT_ATTR volatile uint32_t rtcMainHeartbeatMs;
+RTC_NOINIT_ATTR volatile uint32_t rtcNetworkHeartbeatMs;
+RTC_NOINIT_ATTR volatile uint32_t rtcRenderHeartbeatMs;
 
 uint16_t C_BLACK;
 uint16_t C_WHITE;
@@ -455,7 +520,7 @@ void setError(const char *message) {
   lockState();
   copyText(sharedState.status.lastError, sizeof(sharedState.status.lastError), message);
   unlockState();
-  Serial.printf("[network] %s\n", message);
+  Serial.printf("[error] %s\n", message);
 }
 
 void clearErrorIfHealthy() {
@@ -657,6 +722,103 @@ void persistUiSelection(uint8_t mode, uint8_t screensaverIndex) {
   }
 }
 
+void initializeBootCounter() {
+  Preferences runtimePreferences;
+  if (!runtimePreferences.begin("flight-run", false)) {
+    persistentBootCount = 1;
+    bootCounterPersistent = false;
+    Serial.println("[boot] runtime counter storage unavailable");
+    return;
+  }
+
+  const uint32_t storedCount = runtimePreferences.getULong("boots", 0);
+  persistentBootCount =
+      storedCount < UINT32_MAX ? storedCount + 1U : UINT32_MAX;
+  bootCounterPersistent =
+      runtimePreferences.putULong("boots", persistentBootCount) ==
+      sizeof(persistentBootCount);
+  runtimePreferences.end();
+}
+
+uint64_t currentUptimeSeconds() {
+  const int64_t uptimeUs = esp_timer_get_time();
+  return uptimeUs > 0
+             ? static_cast<uint64_t>(uptimeUs) / 1000000ULL
+             : 0ULL;
+}
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power-on";
+    case ESP_RST_EXT:
+      return "external";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt-wdt";
+    case ESP_RST_TASK_WDT:
+      return "task-wdt";
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_DEEPSLEEP:
+      return "deep-sleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    case ESP_RST_UNKNOWN:
+    default:
+      return "unknown";
+  }
+}
+
+void rememberPanelArmed(bool armed) {
+  rtcRecoveryMagic = RTC_RECOVERY_MAGIC;
+  rtcPanelArmed = armed ? 1U : 0U;
+}
+
+void initializeResetRecovery() {
+  bootResetReason = esp_reset_reason();
+  const bool rtcValid = rtcRecoveryMagic == RTC_RECOVERY_MAGIC;
+
+  previousMainHeartbeatMs = rtcValid ? rtcMainHeartbeatMs : 0;
+  previousNetworkHeartbeatMs = rtcValid ? rtcNetworkHeartbeatMs : 0;
+  previousRenderHeartbeatMs = rtcValid ? rtcRenderHeartbeatMs : 0;
+  const uint32_t previousLastHeartbeatMs = max(
+      previousMainHeartbeatMs,
+      max(previousNetworkHeartbeatMs, previousRenderHeartbeatMs));
+  previousSessionUptimeSeconds = previousLastHeartbeatMs / 1000U;
+
+  // Preserve the user's "panel on" intent across unexpected resets, while a
+  // genuine power-on still requires the deliberate first touch requested for
+  // this installation.
+  panelResumeAfterReset =
+      rtcValid &&
+      rtcPanelArmed != 0U &&
+      bootResetReason != ESP_RST_POWERON;
+
+  rtcRecoveryMagic = RTC_RECOVERY_MAGIC;
+  rtcPanelArmed = panelResumeAfterReset ? 1U : 0U;
+  rtcMainHeartbeatMs = 0;
+  rtcNetworkHeartbeatMs = 0;
+  rtcRenderHeartbeatMs = 0;
+
+  lockState();
+  sharedState.peripheral.panelEnabled = panelResumeAfterReset;
+  unlockState();
+}
+
+uint8_t migrateLegacyScreensaverIndex(uint8_t legacyIndex) {
+  if (legacyIndex <= 3) return legacyIndex;
+  if (legacyIndex <= 5) return 4;   // Removed rings -> bouncing aircraft.
+  if (legacyIndex <= 11) return legacyIndex - 1;
+  if (legacyIndex <= 13) return 11; // Removed abstract contours -> pyramid.
+  return 12;                        // Removed tesseract -> minimal clock.
+}
+
 void restoreUiSelection() {
   uiPreferencesReady = uiPreferences.begin("flight-ui", false);
   if (!uiPreferencesReady) {
@@ -664,8 +826,16 @@ void restoreUiSelection() {
     return;
   }
   persistedUiMode = uiPreferences.getUChar("mode", 0);
+  const uint8_t storedSaver = uiPreferences.getUChar("saver", 0);
+  const uint8_t storedSchema = uiPreferences.getUChar("saver-schema", 0);
   persistedScreensaverIndex =
-      uiPreferences.getUChar("saver", 0) % SCREENSAVER_COUNT;
+      storedSchema < UI_SAVER_SCHEMA_VERSION
+          ? migrateLegacyScreensaverIndex(storedSaver)
+          : storedSaver % SCREENSAVER_COUNT;
+  if (storedSchema < UI_SAVER_SCHEMA_VERSION) {
+    uiPreferences.putUChar("saver", persistedScreensaverIndex);
+    uiPreferences.putUChar("saver-schema", UI_SAVER_SCHEMA_VERSION);
+  }
   lockState();
   sharedState.peripheral.screensaverIndex =
       persistedScreensaverIndex;
@@ -694,6 +864,56 @@ void toggleLastAircraftView() {
   Serial.printf(
       "[button] double tap: last-aircraft=%s\n",
       showingLast ? "on" : "off");
+}
+
+bool dismissLiveAircraftToScreensaver(uint32_t nowMs) {
+  lockState();
+  const bool alertUsable =
+      sharedState.alert.fresh && sharedState.alert.active &&
+      sharedState.alert.receivedMs != 0 &&
+      nowMs - sharedState.alert.receivedMs <= ALERT_TTL_MS;
+  const bool flightUsable =
+      sharedState.flight.fresh && sharedState.flight.active &&
+      sharedState.flight.receivedMs != 0 &&
+      nowMs - sharedState.flight.receivedMs <= FLIGHT_TTL_MS;
+  const bool flightAlreadyDismissed =
+      (sharedState.flight.id[0] != '\0' &&
+       sharedState.peripheral.dismissedFlightId[0] != '\0' &&
+       strcmp(
+           sharedState.flight.id,
+           sharedState.peripheral.dismissedFlightId) == 0) ||
+      (sharedState.flight.id[0] == '\0' &&
+       sharedState.flight.callsign[0] != '\0' &&
+       sharedState.peripheral.dismissedFlightCallsign[0] != '\0' &&
+       strcmp(
+           sharedState.flight.callsign,
+           sharedState.peripheral.dismissedFlightCallsign) == 0);
+  if (alertUsable || !flightUsable || flightAlreadyDismissed) {
+    unlockState();
+    return false;
+  }
+
+  copyText(
+      sharedState.peripheral.dismissedFlightId,
+      sizeof(sharedState.peripheral.dismissedFlightId),
+      sharedState.flight.id);
+  copyText(
+      sharedState.peripheral.dismissedFlightCallsign,
+      sizeof(sharedState.peripheral.dismissedFlightCallsign),
+      sharedState.flight.callsign);
+  sharedState.peripheral.screensaverActive = true;
+  sharedState.peripheral.lastAircraftView = false;
+  sharedState.peripheral.hardwareTestUntilMs = 0;
+  sharedState.peripheral.screenOverride = ScreenOverride::AUTO;
+  const uint8_t index = sharedState.peripheral.screensaverIndex;
+  unlockState();
+
+  persistUiSelection(1, index);
+  Serial.printf(
+      "[button] double tap: live-aircraft dismissed, screensaver=%u/%u\n",
+      static_cast<unsigned>(index + 1),
+      static_cast<unsigned>(SCREENSAVER_COUNT));
+  return true;
 }
 
 void handleSingleTap(uint32_t nowMs) {
@@ -746,6 +966,8 @@ bool wakePanelFromButton() {
 
   if (!wasOff) return false;
 
+  rememberPanelArmed(true);
+
   // Waking the panel is a complete action of its own. Do not interpret the
   // same physical touch as a page change, double tap, or brightness toggle.
   buttonTapCount = 0;
@@ -763,7 +985,12 @@ void registerShortTap(uint32_t nowMs) {
     buttonTapCount = 0;
     buttonSecondTapCandidate = false;
     Serial.println("[button] tap 2");
-    toggleLastAircraftView();
+    // On a live flight, the same gesture acknowledges only that identity and
+    // returns to the selected saver. Everywhere else it retains the original
+    // "Last Aircraft" navigation behavior.
+    if (!dismissLiveAircraftToScreensaver(nowMs)) {
+      toggleLastAircraftView();
+    }
   } else {
     buttonTapCount = 1;
     buttonSecondTapCandidate = false;
@@ -1172,7 +1399,10 @@ void drawAircraft(const SharedState &snapshot) {
   const FlightData &flight = snapshot.flight;
 
   dmaDisplay->fillScreen(C_BLACK);
-  dmaDisplay->drawRect(0, 0, PANEL_RES_X, PANEL_RES_Y, C_BLUE);
+  const uint16_t frameColor =
+      activeVisualMode == VisualMode::DAY
+          ? C_BLUE
+          : color565(255, 105, 0);
 
   char line[48];
   if (flight.count > 1) {
@@ -1210,6 +1440,10 @@ void drawAircraft(const SharedState &snapshot) {
   drawSpeedHeadingLine(flight, 52, C_WHITE);
 
   drawStatusBar(snapshot.status);
+  // Draw the border last so service glyphs can never punch differently
+  // colored pixels through the top edge. Night and sleep always use one
+  // explicit amber around the complete card.
+  dmaDisplay->drawRect(0, 0, PANEL_RES_X, PANEL_RES_Y, frameColor);
 }
 
 void drawLastAircraft(const SharedState &snapshot) {
@@ -1218,8 +1452,8 @@ void drawLastAircraft(const SharedState &snapshot) {
   printCenteredClipped(2, "LAST AIRCRAFT", C_DIM);
 
   if (!flight.active) {
-    printCentered(26, "NO HISTORY", C_WHITE);
-    printCentered(44, "TAP TO RETURN", C_DIM);
+    printCentered(22, "NO HISTORY", C_WHITE);
+    printCentered(35, "TAP TO RETURN", C_DIM);
     drawStatusBar(snapshot.status);
     return;
   }
@@ -1235,7 +1469,7 @@ void drawLastAircraft(const SharedState &snapshot) {
   // Registration is deliberately omitted: the historical card is centered
   // around the useful flight facts that the API can reliably provide.
   printCenteredClipped(
-      32,
+      31,
       safeText(flight.aircraft, "AIRCRAFT"),
       C_CYAN);
   if (!hasPanelText(flight.origin) &&
@@ -1261,9 +1495,9 @@ void drawLastAircraft(const SharedState &snapshot) {
         safeText(flight.origin, "---"),
         safeText(flight.destination, "---"));
   }
-  printCenteredClipped(43, line, C_GREEN);
+  printCenteredClipped(42, line, C_GREEN);
 
-  drawSpeedHeadingLine(flight, 54, C_WHITE);
+  drawSpeedHeadingLine(flight, 53, C_WHITE);
   drawStatusBar(snapshot.status);
 }
 
@@ -1504,14 +1738,18 @@ void drawScreensaverRadar(uint32_t nowMs, const char *timeText) {
 }
 
 float daytimeAnimationEnergy() {
-  const time_t wallClock = time(nullptr);
+  struct timeval wallTime;
+  gettimeofday(&wallTime, nullptr);
+  const time_t wallClock = wallTime.tv_sec;
   struct tm localTime;
   if (wallClock < 100000 ||
       localtime_r(&wallClock, &localTime) == nullptr) {
     return 0.55f;
   }
   const float hour =
-      localTime.tm_hour + localTime.tm_min / 60.0f;
+      localTime.tm_hour +
+      localTime.tm_min / 60.0f +
+      (localTime.tm_sec + wallTime.tv_usec / 1000000.0f) / 3600.0f;
   float energy;
   if (hour < 6.0f || hour >= 22.0f) {
     energy = 0.04f;
@@ -1535,10 +1773,54 @@ void drawStreamlinedClockCentered(
 
 void drawScreensaverWave(uint32_t nowMs, const char *timeText) {
   const float energy = daytimeAnimationEnergy();
-  const float spatialFrequency = 0.024f + energy * 0.076f;
-  const float motionSpeed = 0.000055f + energy * 0.00048f;
-  const float amplitude = 5.0f + energy * 2.5f;
-  const float phase = nowMs * motionSpeed;
+  const float targetSpatialFrequency = 0.024f + energy * 0.076f;
+  const float targetMotionSpeed = 0.000055f + energy * 0.00048f;
+  const float targetAmplitude = 5.0f + energy * 2.5f;
+
+  // Integrate phase from elapsed time instead of multiplying the current
+  // speed by uptime. The latter changes the whole phase whenever the daytime
+  // speed coefficient changes, which was visible as a jump on minute edges.
+  // Frequency, speed, and amplitude approach their targets over 45 seconds,
+  // making the daily compression/relaxation imperceptibly gradual.
+  static bool initialized = false;
+  static uint32_t previousMs = 0;
+  static float spatialFrequency = 0.0f;
+  static float motionSpeed = 0.0f;
+  static float amplitude = 0.0f;
+  static float phase = 0.0f;
+
+  uint32_t elapsedMs = 0;
+  if (!initialized || nowMs < previousMs) {
+    spatialFrequency = targetSpatialFrequency;
+    motionSpeed = targetMotionSpeed;
+    amplitude = targetAmplitude;
+    phase = 0.0f;
+    initialized = true;
+  } else {
+    elapsedMs = nowMs - previousMs;
+    if (elapsedMs > 2000UL) {
+      // The effect was not visible. Resume at today's parameters without
+      // fast-forwarding several hours of animation on the first frame.
+      spatialFrequency = targetSpatialFrequency;
+      motionSpeed = targetMotionSpeed;
+      amplitude = targetAmplitude;
+      elapsedMs = 0;
+    }
+  }
+  previousMs = nowMs;
+
+  if (elapsedMs > 0) {
+    constexpr float smoothingTimeMs = 45000.0f;
+    const float blend =
+        1.0f - expf(-static_cast<float>(elapsedMs) / smoothingTimeMs);
+    spatialFrequency +=
+        (targetSpatialFrequency - spatialFrequency) * blend;
+    motionSpeed += (targetMotionSpeed - motionSpeed) * blend;
+    amplitude += (targetAmplitude - amplitude) * blend;
+    phase += motionSpeed * static_cast<float>(elapsedMs);
+    if (phase >= 2.0f * PI) phase = fmodf(phase, 2.0f * PI);
+  }
+
   for (int16_t x = 0; x < PANEL_RES_X; ++x) {
     const float waveY =
         31.5f + sinf(x * spatialFrequency + phase) * amplitude;
@@ -1753,78 +2035,6 @@ void drawScreensaverLavaLamp(uint32_t nowMs, const char *timeText) {
   // Compact rounded segments stay transparent between their strokes, so the
   // wax continues through the clock without a rectangular background.
   drawCompactRoundedClock(85, 51, timeText, color565(55, 55, 55));
-}
-
-void drawScreensaverRings(uint32_t nowMs) {
-  static bool radiusMapReady = false;
-  // 1/64-pixel cached radii avoid the quarter-pixel stepping of the previous
-  // map while keeping sqrt() out of the 40 fps render path.
-  static uint16_t radiusMap[PANEL_RES_Y][PANEL_RES_X];
-  if (!radiusMapReady) {
-    for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
-      for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-        const float dx = (x - 63.5f) * 0.62f;
-        const float dy = y - 31.5f;
-        radiusMap[y][x] = static_cast<uint16_t>(
-            min(65535.0f, sqrtf(dx * dx + dy * dy) * 64.0f));
-      }
-    }
-    radiusMapReady = true;
-  }
-  static int32_t lastPulseMinute = -1;
-  static uint32_t gravityPulseStartedMs = 0;
-  const time_t wallClock = time(nullptr);
-  struct tm localTime;
-  if (wallClock > 100000 &&
-      localtime_r(&wallClock, &localTime) != nullptr) {
-    const int32_t minuteKey =
-        localTime.tm_yday * 24 * 60 +
-        localTime.tm_hour * 60 +
-        localTime.tm_min;
-    if (localTime.tm_sec == 0 && minuteKey != lastPulseMinute) {
-      lastPulseMinute = minuteKey;
-      gravityPulseStartedMs = nowMs;
-    }
-  }
-  const uint32_t gravityAgeMs = nowMs - gravityPulseStartedMs;
-  constexpr uint32_t gravityDurationMs = 1200;
-  const bool gravityActive =
-      gravityPulseStartedMs != 0 &&
-      gravityAgeMs < gravityDurationMs;
-  const float gravityProgress =
-      gravityActive
-          ? gravityAgeMs / static_cast<float>(gravityDurationMs)
-          : 1.0f;
-  // The contraction front starts just behind the center and travels past the
-  // outer ring. Each radius is pulled inward and then smoothly released as
-  // the front passes it.
-  const float gravityFront = -7.0f + gravityProgress * 63.0f;
-  const float phase = fmodf(nowMs * 0.00048f, 16.0f);
-  for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
-    for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-      const float physicalRadius = radiusMap[y][x] / 64.0f;
-      float gravityScale = 1.0f;
-      if (gravityActive) {
-        const float frontDistance =
-            (physicalRadius - gravityFront) / 5.0f;
-        const float envelope =
-            expf(-0.5f * frontDistance * frontDistance);
-        gravityScale = 1.0f - 0.105f * envelope;
-      }
-      const float radius = physicalRadius / gravityScale;
-      const float band = fmodf(radius - phase + 64.0f, 16.0f);
-      const float distance = min(band, 16.0f - band);
-      float coverage = constrain(1.85f - distance, 0.0f, 1.0f);
-      if (coverage <= 0.0f) continue;
-      coverage = coverage * coverage * (3.0f - 2.0f * coverage);
-      const uint8_t level =
-          static_cast<uint8_t>(roundf(34.0f * coverage));
-      dmaDisplay->drawPixel(
-          x,
-          y,
-          color565(level / 3U, level, level));
-    }
-  }
 }
 
 void drawSubpixelAircraft(
@@ -2399,7 +2609,7 @@ void drawScreensaverWeather(
     snprintf(
         weatherLine,
         sizeof(weatherLine),
-        "%+.0fC  FEELS %+.0fC",
+        "%+.1fC FEELS %+.1fC",
         snapshot.weather.temperatureC,
         snapshot.weather.feelsLikeC);
   } else {
@@ -2411,9 +2621,280 @@ void drawScreensaverWeather(
       warm ? color565(54, 25, 5) : color565(28, 43, 52));
 }
 
+void drawForecastSun(
+    int16_t cx,
+    int16_t cy,
+    int16_t radius,
+    uint16_t color) {
+  dmaDisplay->drawCircle(cx, cy, radius, color);
+  static const int8_t RAY_X[8] = {0, 3, 4, 3, 0, -3, -4, -3};
+  static const int8_t RAY_Y[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
+  for (uint8_t ray = 0; ray < 8; ++ray) {
+    const float scale = radius / 3.0f;
+    const int16_t innerX =
+        cx + static_cast<int16_t>(roundf(RAY_X[ray] * scale));
+    const int16_t innerY =
+        cy + static_cast<int16_t>(roundf(RAY_Y[ray] * scale));
+    const int16_t outerX =
+        cx + static_cast<int16_t>(roundf(RAY_X[ray] * scale * 1.45f));
+    const int16_t outerY =
+        cy + static_cast<int16_t>(roundf(RAY_Y[ray] * scale * 1.45f));
+    dmaDisplay->drawLine(innerX, innerY, outerX, outerY, color);
+  }
+}
+
+void drawForecastCloud(int16_t x, int16_t y, uint16_t color) {
+  dmaDisplay->fillCircle(x + 5, y + 6, 3, color);
+  dmaDisplay->fillCircle(x + 10, y + 4, 4, color);
+  dmaDisplay->fillCircle(x + 15, y + 6, 3, color);
+  dmaDisplay->fillRect(x + 4, y + 6, 13, 4, color);
+}
+
+void drawForecastConditionIcon(
+    int16_t x,
+    int16_t y,
+    uint8_t code,
+    uint16_t primary,
+    uint16_t secondary) {
+  if (code == 0) {
+    drawForecastSun(x + 10, y + 8, 4, primary);
+    return;
+  }
+  if (code <= 3) {
+    drawForecastSun(x + 6, y + 5, 3, secondary);
+    drawForecastCloud(x + 3, y + 6, primary);
+    return;
+  }
+  if (code == 45 || code == 48) {
+    for (int8_t row = 0; row < 3; ++row) {
+      const int16_t offset = (row & 1) ? 3 : 0;
+      dmaDisplay->drawLine(
+          x + offset,
+          y + 5 + row * 4,
+          x + 20 - offset,
+          y + 5 + row * 4,
+          row == 1 ? primary : secondary);
+    }
+    return;
+  }
+
+  drawForecastCloud(x + 1, y + 1, primary);
+  if ((code >= 71 && code <= 77) ||
+      (code >= 85 && code <= 86)) {
+    for (int8_t flake = 0; flake < 3; ++flake) {
+      const int16_t fx = x + 6 + flake * 6;
+      const int16_t fy = y + 15 + (flake & 1);
+      dmaDisplay->drawPixel(fx, fy, secondary);
+      dmaDisplay->drawPixel(fx - 1, fy, secondary);
+      dmaDisplay->drawPixel(fx + 1, fy, secondary);
+      dmaDisplay->drawPixel(fx, fy - 1, secondary);
+      dmaDisplay->drawPixel(fx, fy + 1, secondary);
+    }
+  } else if (code >= 95 && code <= 99) {
+    dmaDisplay->drawLine(x + 12, y + 11, x + 9, y + 15, secondary);
+    dmaDisplay->drawLine(x + 9, y + 15, x + 12, y + 15, secondary);
+    dmaDisplay->drawLine(x + 12, y + 15, x + 9, y + 19, secondary);
+  } else {
+    for (int8_t drop = 0; drop < 3; ++drop) {
+      const int16_t dx = x + 5 + drop * 6;
+      dmaDisplay->drawLine(dx, y + 13, dx - 1, y + 17, secondary);
+    }
+  }
+}
+
+void drawForecastThermometer(
+    int16_t x,
+    int16_t y,
+    uint16_t color) {
+  dmaDisplay->drawLine(x + 2, y, x + 2, y + 11, color);
+  dmaDisplay->drawLine(x + 4, y, x + 4, y + 11, color);
+  dmaDisplay->drawLine(x + 2, y, x + 4, y, color);
+  dmaDisplay->fillCircle(x + 3, y + 13, 3, color);
+  dmaDisplay->drawLine(x + 3, y + 5, x + 3, y + 13, color);
+}
+
+void drawForecastHeatWaves(
+    int16_t x,
+    int16_t y,
+    uint16_t color) {
+  for (int8_t wave = 0; wave < 3; ++wave) {
+    const int16_t wx = x + wave * 3;
+    dmaDisplay->drawLine(wx + 1, y, wx, y + 3, color);
+    dmaDisplay->drawLine(wx, y + 3, wx + 1, y + 6, color);
+    dmaDisplay->drawLine(wx + 1, y + 6, wx, y + 9, color);
+    dmaDisplay->drawLine(wx, y + 9, wx + 1, y + 12, color);
+  }
+}
+
+void drawForecastVerticalArrow(
+    int16_t x,
+    int16_t y,
+    bool up,
+    uint16_t color) {
+  dmaDisplay->drawLine(x, y - 5, x, y + 5, color);
+  const int16_t tipY = up ? y - 5 : y + 5;
+  const int16_t wingY = up ? tipY + 3 : tipY - 3;
+  dmaDisplay->drawLine(x, tipY, x - 2, wingY, color);
+  dmaDisplay->drawLine(x, tipY, x + 2, wingY, color);
+}
+
+void drawForecastWindArrow(
+    int16_t cx,
+    int16_t cy,
+    uint16_t degrees,
+    uint16_t color) {
+  const float angle = degrees * PI / 180.0f;
+  const float dx = sinf(angle);
+  const float dy = -cosf(angle);
+  const int16_t tailX = cx - static_cast<int16_t>(roundf(dx * 6.0f));
+  const int16_t tailY = cy - static_cast<int16_t>(roundf(dy * 6.0f));
+  const int16_t tipX = cx + static_cast<int16_t>(roundf(dx * 6.0f));
+  const int16_t tipY = cy + static_cast<int16_t>(roundf(dy * 6.0f));
+  dmaDisplay->drawLine(tailX, tailY, tipX, tipY, color);
+  const float leftAngle = angle + 2.55f;
+  const float rightAngle = angle - 2.55f;
+  dmaDisplay->drawLine(
+      tipX,
+      tipY,
+      tipX + static_cast<int16_t>(roundf(sinf(leftAngle) * 4.0f)),
+      tipY - static_cast<int16_t>(roundf(cosf(leftAngle) * 4.0f)),
+      color);
+  dmaDisplay->drawLine(
+      tipX,
+      tipY,
+      tipX + static_cast<int16_t>(roundf(sinf(rightAngle) * 4.0f)),
+      tipY - static_cast<int16_t>(roundf(cosf(rightAngle) * 4.0f)),
+      color);
+}
+
+void drawForecastHorizonIcon(
+    int16_t x,
+    int16_t y,
+    bool rising,
+    uint16_t color) {
+  dmaDisplay->drawLine(x, y + 7, x + 14, y + 7, color);
+  for (uint16_t degrees = 180; degrees <= 360; degrees += 20) {
+    const float angle = degrees * PI / 180.0f;
+    dmaDisplay->drawPixel(
+        x + 7 + static_cast<int16_t>(roundf(cosf(angle) * 4.0f)),
+        y + 7 + static_cast<int16_t>(roundf(sinf(angle) * 4.0f)),
+        color);
+  }
+  const int16_t arrowX = x + 12;
+  const int16_t tipY = rising ? y : y + 12;
+  const int16_t tailY = rising ? y + 5 : y + 7;
+  dmaDisplay->drawLine(arrowX, tailY, arrowX, tipY, color);
+  dmaDisplay->drawLine(
+      arrowX,
+      tipY,
+      arrowX - 2,
+      rising ? tipY + 2 : tipY - 2,
+      color);
+  dmaDisplay->drawLine(
+      arrowX,
+      tipY,
+      arrowX + 2,
+      rising ? tipY + 2 : tipY - 2,
+      color);
+}
+
+void drawForecastDegree(int16_t x, int16_t y, uint16_t color) {
+  dmaDisplay->drawCircle(x, y, 1, color);
+}
+
+void drawScreensaverForecast(const SharedState &snapshot) {
+  const bool warm = activeVisualMode != VisualMode::DAY;
+  const uint16_t primaryColor =
+      warm ? color565(58, 31, 7) : color565(52, 58, 60);
+  const uint16_t secondaryColor =
+      warm ? color565(42, 19, 3) : color565(28, 41, 48);
+  const uint16_t accentColor =
+      warm ? color565(62, 38, 8) : color565(12, 54, 62);
+  const uint16_t separatorColor =
+      warm ? color565(20, 7, 1) : color565(7, 14, 18);
+
+  dmaDisplay->setFont();
+  dmaDisplay->setTextSize(1);
+
+  if (!snapshot.weather.valid) {
+    drawForecastCloud(52, 16, secondaryColor);
+    dmaDisplay->drawLine(50, 13, 75, 38, accentColor);
+    printCentered(43, "--.-", secondaryColor);
+    return;
+  }
+
+  char value[12];
+  drawForecastConditionIcon(
+      11,
+      1,
+      snapshot.weather.weatherCode,
+      primaryColor,
+      accentColor);
+  drawForecastThermometer(37, 2, accentColor);
+  snprintf(value, sizeof(value), "%.1f", snapshot.weather.temperatureC);
+  printFixed(45, 6, value, primaryColor);
+  drawForecastDegree(45 + strlen(value) * 6 + 1, 7, primaryColor);
+
+  drawForecastHeatWaves(78, 3, secondaryColor);
+  snprintf(value, sizeof(value), "%.1f", snapshot.weather.feelsLikeC);
+  printFixed(88, 6, value, primaryColor);
+  drawForecastDegree(88 + strlen(value) * 6 + 1, 7, primaryColor);
+
+  dmaDisplay->drawLine(1, 21, 126, 21, separatorColor);
+
+  if (!snapshot.weather.forecastValid) {
+    printCentered(31, "--  --  --  --", secondaryColor);
+    return;
+  }
+
+  drawForecastVerticalArrow(4, 31, false, secondaryColor);
+  snprintf(value, sizeof(value), "%.0f", snapshot.weather.minimumC);
+  printFixed(11, 27, value, primaryColor);
+  drawForecastDegree(11 + strlen(value) * 6 + 1, 28, primaryColor);
+
+  drawForecastVerticalArrow(34, 31, true, accentColor);
+  snprintf(value, sizeof(value), "%.0f", snapshot.weather.maximumC);
+  printFixed(41, 27, value, primaryColor);
+  drawForecastDegree(41 + strlen(value) * 6 + 1, 28, primaryColor);
+
+  drawForecastSun(65, 31, 3, accentColor);
+  snprintf(value, sizeof(value), "%.1f", snapshot.weather.uvIndexCurrent);
+  printFixed(73, 27, value, primaryColor);
+
+  drawForecastWindArrow(
+      101,
+      31,
+      snapshot.weather.windDirectionDeg,
+      accentColor);
+  snprintf(value, sizeof(value), "%.0f", snapshot.weather.windMaxKph);
+  printFixed(111, 27, value, primaryColor);
+
+  dmaDisplay->drawLine(1, 44, 126, 44, separatorColor);
+
+  drawForecastHorizonIcon(8, 48, true, accentColor);
+  snprintf(
+      value,
+      sizeof(value),
+      "%02u:%02u",
+      snapshot.weather.sunriseMin / 60,
+      snapshot.weather.sunriseMin % 60);
+  printFixed(25, 50, value, secondaryColor);
+
+  drawForecastHorizonIcon(74, 48, false, accentColor);
+  snprintf(
+      value,
+      sizeof(value),
+      "%02u:%02u",
+      snapshot.weather.sunsetMin / 60,
+      snapshot.weather.sunsetMin % 60);
+  printFixed(91, 50, value, secondaryColor);
+}
+
 void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
   static bool mapReady = false;
-  static uint8_t clockwiseAngle[PANEL_RES_Y][PANEL_RES_X];
+  // Fine angular coordinates allow a soft moving boundary instead of the
+  // visible 1/256-circle steps of the former byte map.
+  static uint16_t clockwiseAngle[PANEL_RES_Y][PANEL_RES_X];
   if (!mapReady) {
     for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
       for (int16_t x = 0; x < PANEL_RES_X; ++x) {
@@ -2421,16 +2902,17 @@ void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
         const float dy = y - 31.5f;
         float angle = atan2f(dx, -dy);
         if (angle < 0.0f) angle += 2.0f * PI;
-        clockwiseAngle[y][x] = static_cast<uint8_t>(
-            roundf(angle * 255.0f / (2.0f * PI)));
+        clockwiseAngle[y][x] = static_cast<uint16_t>(
+            roundf(angle * 65535.0f / (2.0f * PI)));
       }
     }
     mapReady = true;
   }
 
-  const time_t wallClock = time(nullptr);
+  struct timeval wallTime;
+  gettimeofday(&wallTime, nullptr);
   struct tm localTime;
-  localtime_r(&wallClock, &localTime);
+  localtime_r(&wallTime.tv_sec, &localTime);
   // One complete revolution represents the 60 minutes of the current hour.
   // The sector is stationary during each minute. At the minute boundary it
   // eases across only the newly earned angular distance.
@@ -2439,10 +2921,27 @@ void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
   static float transitionFrom = 0.0f;
   static float transitionTo = 0.0f;
   static uint32_t transitionStartedMs = 0;
-  static uint32_t activeTransitionDurationMs = 900;
   static bool transitionActive = false;
   constexpr uint32_t transitionDurationMs = 900;
-  if (displayedMinute < 0) {
+  const bool hourResetWindow =
+      localTime.tm_min == 59 && localTime.tm_sec == 59;
+  if (hourResetWindow) {
+    // During the final second of the hour the filled sector retreats from its
+    // minute-59 position back to twelve o'clock.  Since clockwiseAngle grows
+    // clockwise, a decreasing threshold makes the visible edge travel
+    // explicitly counterclockwise.  Wall-clock microseconds keep the motion
+    // synchronized even if the renderer skips an individual frame.
+    displayedMinute = 59;
+    transitionActive = false;
+    const float progress =
+        constrain(wallTime.tv_usec / 1000000.0f, 0.0f, 1.0f);
+    const float eased =
+        0.5f - 0.5f * cosf(progress * PI);
+    displayedThreshold =
+        (59.0f * 256.0f / 60.0f) * (1.0f - eased);
+    transitionFrom = displayedThreshold;
+    transitionTo = 0.0f;
+  } else if (displayedMinute < 0) {
     displayedMinute = localTime.tm_min;
     displayedThreshold =
         localTime.tm_min == 0
@@ -2450,23 +2949,14 @@ void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
             : localTime.tm_min * (256.0f / 60.0f);
     transitionFrom = displayedThreshold;
     transitionTo = displayedThreshold;
-  } else if (
-      localTime.tm_min == 59 &&
-      localTime.tm_sec == 59 &&
-      displayedMinute == 59) {
-    // Start the hour reset during 59:59 and finish exactly at 00:00. If this
-    // frame arrives part-way through the second, use only the remaining wall
-    // time instead of letting the clear spill into the new hour.
-    struct timeval wallTime;
-    gettimeofday(&wallTime, nullptr);
-    const uint32_t remainingMs =
-        max(1UL, 1000UL - wallTime.tv_usec / 1000UL);
+  } else if (localTime.tm_min == 0) {
+    // Minute zero is always completely empty, even when the saver was hidden
+    // during 59:59 and therefore could not render the rollback frames.
     displayedMinute = 0;
-    transitionFrom = displayedThreshold;
+    displayedThreshold = 0.0f;
+    transitionFrom = 0.0f;
     transitionTo = 0.0f;
-    transitionStartedMs = nowMs;
-    activeTransitionDurationMs = remainingMs;
-    transitionActive = true;
+    transitionActive = false;
   } else if (displayedMinute != localTime.tm_min) {
     displayedMinute = localTime.tm_min;
     transitionFrom = displayedThreshold;
@@ -2474,14 +2964,22 @@ void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
         localTime.tm_min == 0
             ? 0.0f
             : localTime.tm_min * (256.0f / 60.0f);
-    transitionStartedMs = nowMs;
-    activeTransitionDurationMs = transitionDurationMs;
-    transitionActive = true;
+    const uint32_t elapsedBoundaryMs =
+        localTime.tm_sec == 0
+            ? static_cast<uint32_t>(wallTime.tv_usec / 1000UL)
+            : transitionDurationMs;
+    if (elapsedBoundaryMs >= transitionDurationMs) {
+      displayedThreshold = transitionTo;
+      transitionActive = false;
+    } else {
+      transitionStartedMs = nowMs - elapsedBoundaryMs;
+      transitionActive = true;
+    }
   }
   if (transitionActive) {
     const uint32_t ageMs = nowMs - transitionStartedMs;
     const float progress = constrain(
-        ageMs / static_cast<float>(activeTransitionDurationMs),
+        ageMs / static_cast<float>(transitionDurationMs),
         0.0f,
         1.0f);
     // Cosine easing has zero velocity at both ends and avoids the visible
@@ -2499,14 +2997,36 @@ void drawScreensaverRadialFill(uint32_t nowMs, const char *timeText) {
   const uint16_t threshold =
       static_cast<uint16_t>(roundf(displayedThreshold));
   const bool showFill = threshold > 0;
+  const uint8_t accentRed =
+      activeVisualMode == VisualMode::DAY ? 2 : 46;
+  const uint8_t accentGreen =
+      activeVisualMode == VisualMode::DAY ? 32 : 17;
+  const uint8_t accentBlue =
+      activeVisualMode == VisualMode::DAY ? 48 : 1;
   const uint16_t accent =
-      activeVisualMode == VisualMode::DAY
-          ? color565(2, 32, 48)
-          : color565(46, 17, 1);
+      color565(accentRed, accentGreen, accentBlue);
+  const float fineThreshold = displayedThreshold * 256.0f;
+  const float featherWidth = hourResetWindow ? 2048.0f : 384.0f;
   for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
     for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-      if (showFill && clockwiseAngle[y][x] < threshold) {
+      if (!showFill) continue;
+      const float coverage = constrain(
+          (fineThreshold - clockwiseAngle[y][x]) / featherWidth,
+          0.0f,
+          1.0f);
+      if (coverage <= 0.0f) continue;
+      if (coverage >= 0.995f) {
         dmaDisplay->drawPixel(x, y, accent);
+      } else {
+        const float softCoverage =
+            coverage * coverage * (3.0f - 2.0f * coverage);
+        dmaDisplay->drawPixel(
+            x,
+            y,
+            color565(
+                static_cast<uint8_t>(roundf(accentRed * softCoverage)),
+                static_cast<uint8_t>(roundf(accentGreen * softCoverage)),
+                static_cast<uint8_t>(roundf(accentBlue * softCoverage))));
       }
     }
   }
@@ -2750,70 +3270,183 @@ void drawTopViewFlybyAircraft(
   dmaDisplay->fillCircle(noseX, noseY, 1, color);
 }
 
+void drawAircraftTransitionSilhouette(
+    float x,
+    float y,
+    float angle,
+    uint16_t color,
+    uint16_t outlineColor) {
+  const float forwardX = cosf(angle);
+  const float forwardY = sinf(angle);
+  const float sideX = -forwardY;
+  const float sideY = forwardX;
+
+  const int16_t noseX = roundf(x + forwardX * 10.0f);
+  const int16_t noseY = roundf(y + forwardY * 10.0f);
+  const int16_t tailX = roundf(x - forwardX * 9.0f);
+  const int16_t tailY = roundf(y - forwardY * 9.0f);
+  const int16_t wingLeftX = roundf(x - sideX * 11.0f - forwardX);
+  const int16_t wingLeftY = roundf(y - sideY * 11.0f - forwardY);
+  const int16_t wingRightX = roundf(x + sideX * 11.0f - forwardX);
+  const int16_t wingRightY = roundf(y + sideY * 11.0f - forwardY);
+  const int16_t stabilizerLeftX =
+      roundf(x - sideX * 5.0f - forwardX * 7.0f);
+  const int16_t stabilizerLeftY =
+      roundf(y - sideY * 5.0f - forwardY * 7.0f);
+  const int16_t stabilizerRightX =
+      roundf(x + sideX * 5.0f - forwardX * 7.0f);
+  const int16_t stabilizerRightY =
+      roundf(y + sideY * 5.0f - forwardY * 7.0f);
+
+  // A dark outer silhouette separates the aircraft from both the canvas and
+  // the revealed card. The bright inner strokes make the top-view shape
+  // readable at 128x64 even while it crosses text.
+  drawThickLine(tailX, tailY, noseX, noseY, outlineColor, 7);
+  drawThickLine(
+      wingLeftX,
+      wingLeftY,
+      wingRightX,
+      wingRightY,
+      outlineColor,
+      7);
+  drawThickLine(
+      stabilizerLeftX,
+      stabilizerLeftY,
+      stabilizerRightX,
+      stabilizerRightY,
+      outlineColor,
+      5);
+  dmaDisplay->fillCircle(noseX, noseY, 3, outlineColor);
+
+  drawThickLine(tailX, tailY, noseX, noseY, color, 3);
+  drawThickLine(
+      wingLeftX,
+      wingLeftY,
+      wingRightX,
+      wingRightY,
+      color,
+      3);
+  drawThickLine(
+      stabilizerLeftX,
+      stabilizerLeftY,
+      stabilizerRightX,
+      stabilizerRightY,
+      color,
+      2);
+  dmaDisplay->fillCircle(noseX, noseY, 2, color);
+}
+
 void drawBootIntroOverlay(uint32_t nowMs) {
   const uint32_t ageMs = nowMs - bootIntroStartedMs;
-  const uint16_t canvasColor =
+  const float progress = constrain(
+      ageMs / static_cast<float>(BOOT_INTRO_DURATION_MS),
+      0.0f,
+      1.0f);
+  const float eased =
+      progress * progress * (3.0f - 2.0f * progress);
+  const uint16_t aircraftColor =
       activeVisualMode == VisualMode::DAY
-          ? color565(2, 34, 47)
-          : color565(51, 19, 1);
-  constexpr uint32_t cutDurationMs = 920;
+          ? color565(72, 82, 88)
+          : color565(255, 104, 8);
   constexpr uint8_t bayer4x4[16] = {
       0, 8, 2, 10,
       12, 4, 14, 6,
       3, 11, 1, 9,
       15, 7, 13, 5};
 
-  if (ageMs < cutDurationMs) {
-    const float progress =
-        ageMs / static_cast<float>(cutDurationMs);
-    const float eased =
-        progress * progress * (3.0f - 2.0f * progress);
-    const float aircraftX = -18.0f + eased * 164.0f;
-    for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
-      for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-        const float cutY = 31.5f + (x - 63.5f) * 0.055f;
-        const bool openedBehindAircraft =
-            x < aircraftX - 5.0f &&
-            fabsf(y - cutY) <= 1.4f;
-        if (!openedBehindAircraft) {
-          dmaDisplay->drawPixel(x, y, canvasColor);
-        }
-      }
-    }
-    drawTopViewFlybyAircraft(
-        aircraftX,
-        31.5f,
-        0.0f,
-        activeVisualMode == VisualMode::DAY
-            ? color565(58, 58, 58)
-            : color565(62, 31, 5));
-    return;
-  }
-
-  const float openProgress = constrain(
-      (ageMs - cutDurationMs) /
-          static_cast<float>(BOOT_INTRO_DURATION_MS - cutDurationMs),
+  // A circular aperture opens the already-running saver behind a short runway
+  // takeoff. Ordered dithering is the inexpensive alpha substitute available
+  // in the existing DMA/GFX pipeline.
+  const float revealProgress = constrain(
+      (progress - 0.08f) / 0.74f,
       0.0f,
       1.0f);
-  const float eased =
-      openProgress * openProgress * (3.0f - 2.0f * openProgress);
-  const float opening = 1.0f + eased * 38.0f;
+  const float reveal =
+      revealProgress * revealProgress * (3.0f - 2.0f * revealProgress);
+  const float apertureRadius = reveal * 78.0f;
   for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
     for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-      const float cutY = 31.5f + (x - 63.5f) * 0.055f;
-      const float distance = fabsf(y - cutY);
-      if (distance <= opening) continue;
-      const float feather = constrain(
-          (distance - opening) / 4.0f,
+      const float dx = x - 63.5f;
+      const float dy = (y - 31.5f) * 1.12f;
+      const float distance = sqrtf(dx * dx + dy * dy);
+      if (distance <= apertureRadius) continue;
+      const float blackCoverage = constrain(
+          (distance - apertureRadius) / 4.5f,
           0.0f,
           1.0f);
       const uint8_t threshold =
-          static_cast<uint8_t>(roundf(feather * 15.0f));
+          static_cast<uint8_t>(roundf(blackCoverage * 15.0f));
       if (bayer4x4[(y & 3) * 4 + (x & 3)] <= threshold) {
-        dmaDisplay->drawPixel(x, y, canvasColor);
+        dmaDisplay->drawPixel(x, y, C_BLACK);
       }
     }
   }
+
+  // Perspective runway geometry fades before the saver becomes fully visible.
+  const float runwayAmount = constrain(1.0f - progress / 0.72f, 0.0f, 1.0f);
+  const float runwayFade =
+      runwayAmount * runwayAmount * (3.0f - 2.0f * runwayAmount);
+  if (runwayFade > 0.02f) {
+    const uint8_t edgeLevel = static_cast<uint8_t>(roundf(52.0f * runwayFade));
+    const uint16_t edgeColor =
+        activeVisualMode == VisualMode::DAY
+            ? color565(2, edgeLevel * 3U / 4U, edgeLevel)
+            : color565(edgeLevel * 4U, edgeLevel, 0);
+    dmaDisplay->drawLine(31, 63, 58, 14, edgeColor);
+    dmaDisplay->drawLine(97, 63, 70, 14, edgeColor);
+
+    for (uint8_t marker = 0; marker < 8; ++marker) {
+      const float markerPhase = fmodf(
+          marker / 8.0f + progress * 2.35f,
+          1.0f);
+      const float perspective = powf(markerPhase, 1.65f);
+      const int16_t y = roundf(14.0f + perspective * 50.0f);
+      const int16_t dashLength = 1 + roundf(perspective * 5.0f);
+      dmaDisplay->drawFastVLine(64, y, dashLength, edgeColor);
+    }
+
+    for (uint8_t light = 1; light <= 7; ++light) {
+      const float amount = light / 7.0f;
+      const float perspective = powf(amount, 1.45f);
+      const int16_t y = roundf(14.0f + perspective * 49.0f);
+      const int16_t spread = roundf(6.0f + perspective * 27.0f);
+      dmaDisplay->drawPixel(64 - spread, y, edgeColor);
+      dmaDisplay->drawPixel(64 + spread, y, edgeColor);
+    }
+  }
+
+  // Accelerate from below the panel, lift through the vanishing point, and
+  // leave through the top edge. A slight lateral drift avoids a rigid slide.
+  const float flightProgress = powf(eased, 1.18f);
+  const float aircraftX = 63.5f + sinf(progress * PI) * 1.8f;
+  const float aircraftY = 76.0f - flightProgress * 104.0f;
+  const uint8_t trailLevel = static_cast<uint8_t>(
+      roundf(24.0f * constrain(1.0f - progress / 0.78f, 0.0f, 1.0f)));
+  if (trailLevel > 2 && aircraftY > -10.0f && aircraftY < 63.0f) {
+    const uint16_t trailColor =
+        activeVisualMode == VisualMode::DAY
+            ? color565(trailLevel, trailLevel, trailLevel)
+            : color565(trailLevel * 3U, trailLevel, 0);
+    const int16_t trailEndY = static_cast<int16_t>(
+        roundf(min(63.0f, aircraftY + 18.0f)));
+    dmaDisplay->drawLine(
+        roundf(aircraftX - 3.0f),
+        roundf(aircraftY + 5.0f),
+        roundf(aircraftX - 3.0f),
+        trailEndY,
+        trailColor);
+    dmaDisplay->drawLine(
+        roundf(aircraftX + 3.0f),
+        roundf(aircraftY + 5.0f),
+        roundf(aircraftX + 3.0f),
+        trailEndY,
+        trailColor);
+  }
+  drawTopViewFlybyAircraft(
+      aircraftX,
+      aircraftY,
+      -PI / 2.0f,
+      aircraftColor);
 }
 
 void drawScreensaverAnalogClock(uint32_t nowMs) {
@@ -3097,12 +3730,214 @@ void drawScreensaverGlyphField(uint32_t nowMs, const char *timeText) {
   drawOutlinedRoundedDigitalClock(53, 37, timeText, clockColor);
 }
 
+void drawWeightedPixel(
+    int16_t x,
+    int16_t y,
+    uint8_t red,
+    uint8_t green,
+    uint8_t blue,
+    float weight) {
+  if (x < 0 || x >= PANEL_RES_X ||
+      y < 0 || y >= PANEL_RES_Y ||
+      weight < 0.06f) {
+    return;
+  }
+  const float level = sqrtf(constrain(weight, 0.0f, 1.0f));
+  dmaDisplay->drawPixel(
+      x,
+      y,
+      color565(
+          static_cast<uint8_t>(roundf(red * level)),
+          static_cast<uint8_t>(roundf(green * level)),
+          static_cast<uint8_t>(roundf(blue * level))));
+}
+
+// A compact Wu-style line is enough to keep slowly moving wireframes from
+// snapping between whole HUB75 pixels. It draws no persistent framebuffer and
+// remains inside the existing DMA/GFX pipeline.
+void drawSoftLine(
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    uint8_t red,
+    uint8_t green,
+    uint8_t blue) {
+  const float dx = x1 - x0;
+  const float dy = y1 - y0;
+  if (fabsf(dx) >= fabsf(dy)) {
+    if (x0 > x1) {
+      const float tx = x0;
+      const float ty = y0;
+      x0 = x1;
+      y0 = y1;
+      x1 = tx;
+      y1 = ty;
+    }
+    const float span = x1 - x0;
+    if (span < 0.01f) {
+      drawWeightedPixel(roundf(x0), roundf(y0), red, green, blue, 1.0f);
+      return;
+    }
+    const int16_t start = static_cast<int16_t>(ceilf(x0));
+    const int16_t end = static_cast<int16_t>(floorf(x1));
+    for (int16_t x = start; x <= end; ++x) {
+      const float amount = (x - x0) / span;
+      const float y = y0 + (y1 - y0) * amount;
+      const int16_t baseY = static_cast<int16_t>(floorf(y));
+      const float fraction = y - baseY;
+      drawWeightedPixel(x, baseY, red, green, blue, 1.0f - fraction);
+      drawWeightedPixel(x, baseY + 1, red, green, blue, fraction);
+    }
+  } else {
+    if (y0 > y1) {
+      const float tx = x0;
+      const float ty = y0;
+      x0 = x1;
+      y0 = y1;
+      x1 = tx;
+      y1 = ty;
+    }
+    const float span = y1 - y0;
+    if (span < 0.01f) {
+      drawWeightedPixel(roundf(x0), roundf(y0), red, green, blue, 1.0f);
+      return;
+    }
+    const int16_t start = static_cast<int16_t>(ceilf(y0));
+    const int16_t end = static_cast<int16_t>(floorf(y1));
+    for (int16_t y = start; y <= end; ++y) {
+      const float amount = (y - y0) / span;
+      const float x = x0 + (x1 - x0) * amount;
+      const int16_t baseX = static_cast<int16_t>(floorf(x));
+      const float fraction = x - baseX;
+      drawWeightedPixel(baseX, y, red, green, blue, 1.0f - fraction);
+      drawWeightedPixel(baseX + 1, y, red, green, blue, fraction);
+    }
+  }
+}
+
+void rotateSaverVertex3(
+    SaverVertex3 &vertex,
+    float cosX,
+    float sinX,
+    float cosY,
+    float sinY,
+    float cosZ,
+    float sinZ) {
+  float first = vertex.x * cosY + vertex.z * sinY;
+  float second = -vertex.x * sinY + vertex.z * cosY;
+  vertex.x = first;
+  vertex.z = second;
+
+  first = vertex.y * cosX - vertex.z * sinX;
+  second = vertex.y * sinX + vertex.z * cosX;
+  vertex.y = first;
+  vertex.z = second;
+
+  first = vertex.x * cosZ - vertex.y * sinZ;
+  second = vertex.x * sinZ + vertex.y * cosZ;
+  vertex.x = first;
+  vertex.y = second;
+}
+
+void drawScreensaverSquarePyramid(uint32_t nowMs) {
+  constexpr uint8_t vertexCount = 5;
+  SaverVertex3 vertices[vertexCount] = {
+      {-1.0f, -0.72f, -1.0f, 0.0f, 0.0f},
+      {1.0f, -0.72f, -1.0f, 0.0f, 0.0f},
+      {1.0f, -0.72f, 1.0f, 0.0f, 0.0f},
+      {-1.0f, -0.72f, 1.0f, 0.0f, 0.0f},
+      {0.0f, 1.38f, 0.0f, 0.0f, 0.0f}};
+  constexpr uint8_t edges[8][2] = {
+      {0, 1}, {1, 2}, {2, 3}, {3, 0},
+      {0, 4}, {1, 4}, {2, 4}, {3, 4}};
+  const float seconds = nowMs / 1000.0f;
+  const float angleY = seconds * 0.13f;
+  const float angleX = 0.36f + sinf(seconds * 0.071f) * 0.16f;
+  const float angleZ = sinf(seconds * 0.053f) * 0.12f;
+  const float cosX = cosf(angleX);
+  const float sinX = sinf(angleX);
+  const float cosY = cosf(angleY);
+  const float sinY = sinf(angleY);
+  const float cosZ = cosf(angleZ);
+  const float sinZ = sinf(angleZ);
+
+  for (uint8_t i = 0; i < vertexCount; ++i) {
+    rotateSaverVertex3(
+        vertices[i], cosX, sinX, cosY, sinY, cosZ, sinZ);
+    const float perspective = 4.4f / (4.4f - vertices[i].z);
+    vertices[i].screenX = 63.5f + vertices[i].x * 20.0f * perspective;
+    vertices[i].screenY = 31.5f - vertices[i].y * 20.0f * perspective;
+  }
+
+  uint8_t order[8];
+  float depth[8];
+  for (uint8_t edge = 0; edge < 8; ++edge) {
+    order[edge] = edge;
+    depth[edge] =
+        (vertices[edges[edge][0]].z + vertices[edges[edge][1]].z) * 0.5f;
+  }
+  for (uint8_t i = 1; i < 8; ++i) {
+    const uint8_t candidate = order[i];
+    int8_t j = i - 1;
+    while (j >= 0 && depth[order[j]] > depth[candidate]) {
+      order[j + 1] = order[j];
+      --j;
+    }
+    order[j + 1] = candidate;
+  }
+
+  for (uint8_t position = 0; position < 8; ++position) {
+    const uint8_t edge = order[position];
+    const uint8_t a = edges[edge][0];
+    const uint8_t b = edges[edge][1];
+    const float normalizedDepth =
+        constrain((depth[edge] + 1.4f) / 2.8f, 0.0f, 1.0f);
+    const uint8_t level =
+        static_cast<uint8_t>(roundf(34.0f + normalizedDepth * 82.0f));
+    drawSoftLine(
+        vertices[a].screenX,
+        vertices[a].screenY,
+        vertices[b].screenX,
+        vertices[b].screenY,
+        static_cast<uint8_t>(level * 0.28f),
+        static_cast<uint8_t>(level * 0.82f),
+        level);
+  }
+
+  for (uint8_t i = 0; i < vertexCount; ++i) {
+    const uint8_t level = static_cast<uint8_t>(
+        roundf(55.0f + constrain((vertices[i].z + 1.5f) / 3.0f, 0.0f, 1.0f) *
+                           70.0f));
+    dmaDisplay->drawPixel(
+        roundf(vertices[i].screenX),
+        roundf(vertices[i].screenY),
+        color565(level / 3U, level * 3U / 4U, level));
+  }
+}
+
+void drawScreensaverMinimalClock(
+    uint32_t nowMs,
+    const char *timeText) {
+  char dateText[16] = "--/--";
+  const time_t wallClock = time(nullptr);
+  struct tm localTime;
+  if (wallClock > 100000 &&
+      localtime_r(&wallClock, &localTime) != nullptr) {
+    strftime(dateText, sizeof(dateText), "%d/%m", &localTime);
+  }
+  drawBoldClock(timeText, 14, nowMs);
+  printCentered(41, dateText, color565(70, 70, 70));
+}
+
 void drawScreensaver(
     const SharedState &snapshot,
     const char *timeText,
     uint32_t nowMs) {
   dmaDisplay->fillScreen(C_BLACK);
-  switch (snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT) {
+  const uint8_t saverIndex =
+      snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT;
+  switch (saverIndex) {
     case 0:
       drawScreensaverRadar(nowMs, timeText);
       break;
@@ -3116,32 +3951,42 @@ void drawScreensaver(
       drawScreensaverLavaLamp(nowMs, timeText);
       break;
     case 4:
-      drawScreensaverRings(nowMs);
-      break;
-    case 5:
       drawScreensaverAircraftBounce(nowMs);
       break;
-    case 6:
+    case 5:
       drawScreensaverWeather(snapshot, timeText);
       break;
-    case 7:
+    case 6:
       drawScreensaverRadialFill(nowMs, timeText);
       break;
-    case 8:
+    case 7:
       drawScreensaverFlipClock(nowMs, timeText);
       break;
-    case 9:
+    case 8:
       drawScreensaverAnalogClock(nowMs);
       break;
-    case 10:
+    case 9:
       drawScreensaverFlightThroughStars(nowMs);
       break;
-    case 11:
-    default:
+    case 10:
       drawScreensaverGlyphField(nowMs, timeText);
       break;
+    case 11:
+      drawScreensaverSquarePyramid(nowMs);
+      break;
+    case 12:
+      drawScreensaverMinimalClock(nowMs, timeText);
+      break;
+    case 13:
+      drawScreensaverForecast(snapshot);
+      break;
+    default:
+      drawScreensaverMinimalClock(nowMs, timeText);
+      break;
   }
-  drawStatusBar(snapshot.status);
+  if (saverIndex != 12) {
+    drawStatusBar(snapshot.status);
+  }
 }
 
 void drawScreensaverToAircraftTransition(
@@ -3150,71 +3995,89 @@ void drawScreensaverToAircraftTransition(
     uint32_t nowMs,
     uint32_t startedMs) {
   const uint32_t ageMs = nowMs - startedMs;
-  const float heading =
-      snapshot.flight.headingDeg >= 0
-          ? snapshot.flight.headingDeg * (PI / 180.0f) - PI / 2.0f
-          : 0.0f;
-  const float forwardX = cosf(heading);
-  const float forwardY = sinf(heading);
-  const float sideX = -forwardY;
-  const float sideY = forwardX;
   const uint16_t aircraftColor =
       activeVisualMode == VisualMode::DAY
-          ? color565(62, 62, 62)
-          : color565(63, 30, 4);
-  const uint16_t cutColor =
+          ? color565(190, 220, 235)
+          : color565(255, 174, 48);
+  const uint16_t aircraftOutlineColor =
       activeVisualMode == VisualMode::DAY
-          ? color565(0, 38, 48)
-          : color565(50, 18, 1);
-
-  if (ageMs < AIRCRAFT_TRANSITION_FLYBY_MS) {
-    // The actual flight heading drives the fly-by, so the transition also
-    // communicates the aircraft's direction before the data card appears.
-    drawScreensaver(snapshot, timeText, nowMs);
-    const float progress =
-        ageMs / static_cast<float>(AIRCRAFT_TRANSITION_FLYBY_MS);
-    const float eased =
-        progress * progress * (3.0f - 2.0f * progress);
-    const float travel = -94.0f + eased * 104.0f;
-    const float aircraftX = 63.5f + forwardX * travel;
-    const float aircraftY = 31.5f + forwardY * travel;
-    dmaDisplay->drawLine(
-        roundf(63.5f - forwardX * 92.0f),
-        roundf(31.5f - forwardY * 92.0f),
-        roundf(aircraftX - forwardX * 9.0f),
-        roundf(aircraftY - forwardY * 9.0f),
-        cutColor);
-    drawTopViewFlybyAircraft(
-        aircraftX,
-        aircraftY,
-        heading,
-        aircraftColor);
-    return;
-  }
-
-  // The fly-by cuts a heading-aligned slit through the old saver. The live
-  // flight card is already rendered below it and is revealed by a soft,
-  // dithered opening rather than an abrupt full-screen switch.
-  drawAircraft(snapshot);
-  const float progress = constrain(
-      (ageMs - AIRCRAFT_TRANSITION_FLYBY_MS) /
-          static_cast<float>(
-              AIRCRAFT_TRANSITION_DURATION_MS -
-              AIRCRAFT_TRANSITION_FLYBY_MS),
-      0.0f,
-      1.0f);
-  const float eased =
-      progress * progress * (3.0f - 2.0f * progress);
-  const float opening = 0.7f + eased * 78.0f;
+          ? color565(0, 5, 8)
+          : color565(24, 5, 0);
+  const uint16_t canvasColor =
+      activeVisualMode == VisualMode::DAY
+          ? color565(2, 34, 47)
+          : color565(105, 37, 2);
   constexpr uint8_t bayer4x4[16] = {
       0, 8, 2, 10,
       12, 4, 14, 6,
       3, 11, 1, 9,
       15, 7, 13, 5};
+
+  if (ageMs < AIRCRAFT_TRANSITION_FILL_MS) {
+    // Quickly fade a solid canvas over the current UI. Ordered dithering is
+    // the inexpensive alpha substitute in the DMA/GFX pipeline and avoids the
+    // directional hard edge of the former left-to-right wipe.
+    drawScreensaver(snapshot, timeText, nowMs);
+    const float progress =
+        ageMs / static_cast<float>(AIRCRAFT_TRANSITION_FILL_MS);
+    const float eased =
+        progress * progress * (3.0f - 2.0f * progress);
+    const uint8_t coverage = static_cast<uint8_t>(
+        constrain(roundf(eased * 16.0f), 0.0f, 16.0f));
+    for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
+      for (int16_t x = 0; x < PANEL_RES_X; ++x) {
+        if (bayer4x4[(y & 3) * 4 + (x & 3)] < coverage) {
+          dmaDisplay->drawPixel(x, y, canvasColor);
+        }
+      }
+    }
+    return;
+  }
+
+  // The former button-start canvas now reveals the live flight card beneath.
+  drawAircraft(snapshot);
+  const uint32_t cutAgeMs = ageMs - AIRCRAFT_TRANSITION_FILL_MS;
+  if (cutAgeMs < AIRCRAFT_TRANSITION_CUT_MS) {
+    const float progress =
+        cutAgeMs / static_cast<float>(AIRCRAFT_TRANSITION_CUT_MS);
+    const float eased =
+        progress * progress * (3.0f - 2.0f * progress);
+    const float aircraftX = -18.0f + eased * 164.0f;
+    for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
+      for (int16_t x = 0; x < PANEL_RES_X; ++x) {
+        const float cutY = 31.5f + (x - 63.5f) * 0.055f;
+        const bool openedBehindAircraft =
+            x < aircraftX - 5.0f &&
+            fabsf(y - cutY) <= 1.4f;
+        if (!openedBehindAircraft) {
+          dmaDisplay->drawPixel(x, y, canvasColor);
+        }
+      }
+    }
+    drawAircraftTransitionSilhouette(
+        aircraftX,
+        31.5f + (aircraftX - 63.5f) * 0.055f,
+        atanf(0.055f),
+        aircraftColor,
+        aircraftOutlineColor);
+    return;
+  }
+
+  const float progress = constrain(
+      (cutAgeMs - AIRCRAFT_TRANSITION_CUT_MS) /
+          static_cast<float>(
+              AIRCRAFT_TRANSITION_DURATION_MS -
+              AIRCRAFT_TRANSITION_FILL_MS -
+              AIRCRAFT_TRANSITION_CUT_MS),
+      0.0f,
+      1.0f);
+  const float eased =
+      progress * progress * (3.0f - 2.0f * progress);
+  const float opening = 0.7f + eased * 78.0f;
   for (int16_t y = 0; y < PANEL_RES_Y; ++y) {
     for (int16_t x = 0; x < PANEL_RES_X; ++x) {
-      const float perpendicular = fabsf(
-          (x - 63.5f) * sideX + (y - 31.5f) * sideY);
+      const float cutY = 31.5f + (x - 63.5f) * 0.055f;
+      const float perpendicular = fabsf(y - cutY);
       if (perpendicular <= opening) continue;
       const float blackCoverage = constrain(
           (perpendicular - opening) / 3.5f,
@@ -3223,17 +4086,10 @@ void drawScreensaverToAircraftTransition(
       const uint8_t threshold =
           static_cast<uint8_t>(roundf(blackCoverage * 15.0f));
       if (bayer4x4[(y & 3) * 4 + (x & 3)] <= threshold) {
-        dmaDisplay->drawPixel(x, y, C_BLACK);
+        dmaDisplay->drawPixel(x, y, canvasColor);
       }
     }
   }
-
-  const float travel = 10.0f + min(1.0f, progress * 1.55f) * 94.0f;
-  drawTopViewFlybyAircraft(
-      63.5f + forwardX * travel,
-      31.5f + forwardY * travel,
-      heading,
-      aircraftColor);
 }
 
 // =========================
@@ -3250,6 +4106,18 @@ AppState selectAppState(const SharedState &snapshot, uint32_t nowMs) {
   const bool flightUsable =
       snapshot.flight.fresh && snapshot.flight.active &&
       isFresh(snapshot.flight.receivedMs, FLIGHT_TTL_MS, nowMs);
+  const bool flightDismissed =
+      (snapshot.flight.id[0] != '\0' &&
+       snapshot.peripheral.dismissedFlightId[0] != '\0' &&
+       strcmp(
+           snapshot.flight.id,
+           snapshot.peripheral.dismissedFlightId) == 0) ||
+      (snapshot.flight.id[0] == '\0' &&
+       snapshot.flight.callsign[0] != '\0' &&
+       snapshot.peripheral.dismissedFlightCallsign[0] != '\0' &&
+       strcmp(
+           snapshot.flight.callsign,
+           snapshot.peripheral.dismissedFlightCallsign) == 0);
   const bool hardwareTestActive =
       snapshot.peripheral.hardwareTestUntilMs != 0 &&
       static_cast<int32_t>(
@@ -3258,7 +4126,7 @@ AppState selectAppState(const SharedState &snapshot, uint32_t nowMs) {
   // Safety priority is unconditional, including while a diagnostic saver is
   // selected from Serial: ALERT > live AIRCRAFT > every UI page.
   if (alertUsable) return AppState::ALERT;
-  if (flightUsable) return AppState::AIRCRAFT;
+  if (flightUsable && !flightDismissed) return AppState::AIRCRAFT;
 
   switch (snapshot.peripheral.screenOverride) {
     case ScreenOverride::IDLE:
@@ -3373,23 +4241,26 @@ uint32_t renderIntervalMs(
   if (appState != AppState::SCREENSAVER) return 100;
 
   switch (snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT) {
-    case 4:
-      return 20;  // Rings retain extra temporal resolution.
     case 3:
       return 33;  // Slow metaballs do not need a full 40 fps.
-    case 6:
+    case 5:
       return 1000;  // Weather/date clock is static between updates.
-    case 7:
-      // Burst to 40 fps around the minute boundary and during the one-second
+    case 6: {
+      // Burst to roughly 60 fps around the minute boundary and during the one-second
       // 59:59 -> 00:00 hour reset; remain static otherwise.
-      return time(nullptr) % 60 <= 1 ||
-                     time(nullptr) % 60 >= 59
-                 ? 25
-                 : 1000;
-    case 8:
+      const uint8_t second = static_cast<uint8_t>(time(nullptr) % 60);
+      return second == 0 || second == 59 ? 16 : 1000;
+    }
+    case 7:
       return 40;  // Flip cards only need a subtle colon animation.
-    case 11:
+    case 10:
       return 50;  // Sparse glyph rain is intentionally calm.
+    case 11:
+      return 33;  // Slow subpixel geometry is smooth at roughly 30 fps.
+    case 12:
+      return IDLE_BREATH_FRAME_MS;  // Only the one-second colon breath moves.
+    case 13:
+      return 1000;  // Compact daily forecast changes only with source data.
     default:
       return SCREENSAVER_FRAME_MS;
   }
@@ -3473,12 +4344,24 @@ uint32_t renderSignature(
 
     case AppState::SCREENSAVER:
       hashValue(hash, snapshot.peripheral.screensaverIndex);
-      if (snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT == 6) {
+      if (snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT == 5 ||
+          snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT == 13) {
         hashValue(hash, snapshot.weather.valid);
+        hashValue(hash, snapshot.weather.forecastValid);
         hashValue(hash, snapshot.weather.temperatureC);
         hashValue(hash, snapshot.weather.feelsLikeC);
         hashText(hash, snapshot.weather.observedAt);
         hashText(hash, timeText);
+      }
+      if (snapshot.peripheral.screensaverIndex % SCREENSAVER_COUNT == 13) {
+        hashValue(hash, snapshot.weather.minimumC);
+        hashValue(hash, snapshot.weather.maximumC);
+        hashValue(hash, snapshot.weather.uvIndexCurrent);
+        hashValue(hash, snapshot.weather.windMaxKph);
+        hashValue(hash, snapshot.weather.windDirectionDeg);
+        hashValue(hash, snapshot.weather.sunriseMin);
+        hashValue(hash, snapshot.weather.sunsetMin);
+        hashValue(hash, snapshot.weather.weatherCode);
       }
       hashValue(hash, nowMs / renderIntervalMs(appState, snapshot));
       break;
@@ -3695,6 +4578,7 @@ void renderTask(void *parameter) {
   uint32_t lastDisplayInitAttemptMs = 0;
 
   for (;;) {
+    rtcRenderHeartbeatMs = millis();
     if (!displayReady) {
       const SharedState standbySnapshot = copyState();
       if (!standbySnapshot.peripheral.panelEnabled) {
@@ -3722,7 +4606,7 @@ void renderTask(void *parameter) {
       aircraftTransitionActive = false;
     } else if (
         !aircraftTransitionActive &&
-        previousAppState == AppState::SCREENSAVER) {
+        previousAppState != AppState::AIRCRAFT) {
       aircraftTransitionActive = true;
       aircraftTransitionStartedMs = nowMs;
       displayedSignature = 0;
@@ -3812,14 +4696,17 @@ void renderTask(void *parameter) {
       hashValue(signature, introFrame);
     }
     if (aircraftTransitionActive) {
-      const uint32_t transitionFrame = nowMs / SCREENSAVER_FRAME_MS;
+      const uint32_t transitionFrame =
+          nowMs / AIRCRAFT_TRANSITION_FRAME_MS;
       hashValue(signature, transitionFrame);
     }
     const uint32_t renderInterval =
         snapshot.peripheral.panelEnabled
-            ? (bootIntroActive || aircraftTransitionActive
-                   ? SCREENSAVER_FRAME_MS
-                   : renderIntervalMs(appState, snapshot))
+            ? (aircraftTransitionActive
+                   ? AIRCRAFT_TRANSITION_FRAME_MS
+                   : (bootIntroActive
+                          ? SCREENSAVER_FRAME_MS
+                          : renderIntervalMs(appState, snapshot)))
             : 250;
     const bool animated =
         snapshot.peripheral.panelEnabled &&
@@ -3966,7 +4853,14 @@ bool httpGetJson(
 
   bool began = false;
   if (strncmp(url, "https://", 8) == 0) {
-    secureClient.setInsecure();
+    if (strncmp(url, "https://api.open-meteo.com/", 27) == 0) {
+      secureClient.setCACert(OPEN_METEO_ROOT_CA);
+    } else {
+      // Deployment-controlled endpoints currently have no bundled CA. Keep
+      // their legacy behavior separate from Open-Meteo, whose location-bearing
+      // request must always use authenticated TLS.
+      secureClient.setInsecure();
+    }
     const uint32_t handshakeSeconds =
         timeoutMs / 1000U < 5U ? 5U : timeoutMs / 1000U;
     secureClient.setHandshakeTimeout(handshakeSeconds);
@@ -4066,81 +4960,17 @@ bool parseIsoMinute(const char *iso, uint16_t &minuteOfDay) {
   return true;
 }
 
-bool pollSolarTimes() {
-  char url[256];
-  snprintf(
-      url,
-      sizeof(url),
-      "http://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f&daily=sunrise,sunset&timezone=Asia%%2FJerusalem&forecast_days=1",
-      static_cast<double>(HOME_LATITUDE),
-      static_cast<double>(HOME_LONGITUDE));
-
-  JsonDocument doc;
-  uint32_t durationMs = 0;
-  int httpCode = 0;
-  const bool success = httpGetJson(
-      url,
-      doc,
-      durationMs,
-      httpCode,
-      EXTERNAL_HTTP_TIMEOUT_MS);
-
-  lockState();
-  ++sharedState.metrics.solarRequests;
-  sharedState.metrics.lastSolarDurationMs = durationMs;
-  sharedState.metrics.lastSolarHttpCode = httpCode;
-  if (!success) {
-    ++sharedState.metrics.solarFailures;
-    sharedState.solar.lastFetchOk = false;
-    unlockState();
-    return false;
-  }
-  unlockState();
-
-  const char *date = doc["daily"]["time"][0] | "";
-  const char *sunriseIso = doc["daily"]["sunrise"][0] | "";
-  const char *sunsetIso = doc["daily"]["sunset"][0] | "";
-  uint16_t sunriseMin = 0;
-  uint16_t sunsetMin = 0;
-  if (date[0] == '\0' ||
-      !parseIsoMinute(sunriseIso, sunriseMin) ||
-      !parseIsoMinute(sunsetIso, sunsetMin) ||
-      sunriseMin >= sunsetMin) {
-    lockState();
-    ++sharedState.metrics.solarFailures;
-    sharedState.solar.lastFetchOk = false;
-    unlockState();
-    setError("Solar API parse failed");
-    return false;
-  }
-
-  lockState();
-  sharedState.solar.valid = true;
-  sharedState.solar.lastFetchOk = true;
-  sharedState.solar.sunriseMin = sunriseMin;
-  sharedState.solar.sunsetMin = sunsetMin;
-  copyText(
-      sharedState.solar.date,
-      sizeof(sharedState.solar.date),
-      date);
-  sharedState.solar.receivedMs = millis();
-  unlockState();
-  Serial.printf(
-      "[solar] %s sunrise=%02u:%02u sunset=%02u:%02u\n",
-      date,
-      sunriseMin / 60,
-      sunriseMin % 60,
-      sunsetMin / 60,
-      sunsetMin % 60);
-  return true;
-}
-
 void pollAlerts() {
   JsonDocument doc;
   uint32_t durationMs = 0;
   int httpCode = 0;
 
-  const bool success = httpGetJson(ALERTS_URL, doc, durationMs, httpCode);
+  const bool success = httpGetJson(
+      ALERTS_URL,
+      doc,
+      durationMs,
+      httpCode,
+      ALERT_HTTP_TIMEOUT_MS);
   recordRequest(true, success, durationMs, httpCode);
   if (!success) {
     setApiStatus(true, false);
@@ -4259,6 +5089,11 @@ void pollFlights() {
   sharedState.flight = nextFlight;
   if (nextFlight.active) {
     sharedState.lastAircraft = nextFlight;
+  } else {
+    // A successful empty response ends the acknowledged encounter. The same
+    // identifier may therefore be shown again on a later, separate pass.
+    sharedState.peripheral.dismissedFlightId[0] = '\0';
+    sharedState.peripheral.dismissedFlightCallsign[0] = '\0';
   }
   unlockState();
   setApiStatus(false, true);
@@ -4324,14 +5159,30 @@ bool pollHistory() {
 }
 
 bool pollWeather() {
-  char url[320];
+  if (!HAS_LOCATION_CONFIGURATION) {
+    lockState();
+    sharedState.weather.valid = false;
+    sharedState.weather.forecastValid = false;
+    sharedState.weather.lastFetchOk = false;
+    sharedState.solar.valid = false;
+    sharedState.solar.lastFetchOk = false;
+    unlockState();
+    setAuxStatus(true, false);
+    setError("Weather disabled: location not configured");
+    return true;
+  }
+
+  char url[640];
   snprintf(
       url,
       sizeof(url),
-      "http://api.open-meteo.com/v1/forecast?"
+      "https://api.open-meteo.com/v1/forecast?"
       "latitude=%.6f&longitude=%.6f&"
-      "current=temperature_2m,apparent_temperature&"
-      "current_weather=true&forecast_days=1&"
+      "current=temperature_2m,apparent_temperature,uv_index&"
+      "daily=weather_code,temperature_2m_max,temperature_2m_min,"
+      "sunrise,sunset,wind_speed_10m_max,"
+      "wind_direction_10m_dominant&"
+      "forecast_days=1&"
       "timezone=Asia%%2FJerusalem",
       static_cast<double>(HOME_LATITUDE),
       static_cast<double>(HOME_LONGITUDE));
@@ -4346,10 +5197,23 @@ bool pollWeather() {
       httpCode,
       EXTERNAL_HTTP_TIMEOUT_MS);
   lockState();
+  // This single transfer supplies both current weather and solar times.
+  // Keep the logical subsystem counters for diagnostics, while the Open-Meteo
+  // counter records the real number of billable API calls.
+  ++sharedState.metrics.openMeteoRequests;
   ++sharedState.metrics.weatherRequests;
+  ++sharedState.metrics.solarRequests;
   sharedState.metrics.lastWeatherDurationMs = durationMs;
   sharedState.metrics.lastWeatherHttpCode = httpCode;
-  if (!success) ++sharedState.metrics.weatherFailures;
+  sharedState.metrics.lastSolarDurationMs = durationMs;
+  sharedState.metrics.lastSolarHttpCode = httpCode;
+  if (!success) {
+    ++sharedState.metrics.openMeteoFailures;
+    ++sharedState.metrics.weatherFailures;
+    ++sharedState.metrics.solarFailures;
+    sharedState.weather.lastFetchOk = false;
+    sharedState.solar.lastFetchOk = false;
+  }
   unlockState();
   if (!success) {
     Serial.printf(
@@ -4361,52 +5225,126 @@ bool pollWeather() {
   }
 
   JsonObject current = doc["current"].as<JsonObject>();
-  JsonObject currentWeather = doc["current_weather"].as<JsonObject>();
+  JsonObject daily = doc["daily"].as<JsonObject>();
   float temperature = current["temperature_2m"] | NAN;
   float feelsLike = current["apparent_temperature"] | NAN;
+  const float uvIndexCurrent = current["uv_index"] | NAN;
   const char *observedAt = current["time"] | "";
-  if (!isfinite(temperature)) {
-    temperature = currentWeather["temperature"] | NAN;
-    observedAt = currentWeather["time"] | "";
-  }
-  // Keep the weather page useful on older Open-Meteo response variants that
-  // expose current temperature but omit apparent_temperature.
-  if (!isfinite(feelsLike) && isfinite(temperature)) {
-    feelsLike = temperature;
-  }
-  if (!isfinite(temperature) || !isfinite(feelsLike)) {
+  const float minimum = daily["temperature_2m_min"][0] | NAN;
+  const float maximum = daily["temperature_2m_max"][0] | NAN;
+  const float windMaxKph = daily["wind_speed_10m_max"][0] | NAN;
+  const int windDirection =
+      daily["wind_direction_10m_dominant"][0] | -1;
+  const int weatherCode = daily["weather_code"][0] | -1;
+  const char *forecastDate = daily["time"][0] | "";
+  const char *sunriseIso = daily["sunrise"][0] | "";
+  const char *sunsetIso = daily["sunset"][0] | "";
+  uint16_t sunriseMin = 0;
+  uint16_t sunsetMin = 0;
+  const bool forecastValid =
+      isfinite(minimum) &&
+      isfinite(maximum) &&
+      isfinite(windMaxKph) &&
+      windDirection >= 0 && windDirection <= 360 &&
+      weatherCode >= 0 && weatherCode <= 99 &&
+      forecastDate[0] != '\0' &&
+      parseIsoMinute(sunriseIso, sunriseMin) &&
+      parseIsoMinute(sunsetIso, sunsetMin) &&
+      sunriseMin < sunsetMin;
+  if (!isfinite(temperature) ||
+      !isfinite(feelsLike) ||
+      !isfinite(uvIndexCurrent) ||
+      !forecastValid) {
     lockState();
+    ++sharedState.metrics.openMeteoFailures;
     ++sharedState.metrics.weatherFailures;
+    ++sharedState.metrics.solarFailures;
     sharedState.weather.lastFetchOk = false;
+    sharedState.solar.lastFetchOk = false;
     unlockState();
     setAuxStatus(true, false);
     setError("Weather API parse failed");
     Serial.printf(
-        "[weather] parse failed code=%d duration=%lums current=%s fallback=%s\n",
+        "[weather] parse failed code=%d duration=%lums current=%s daily=%s\n",
         httpCode,
         static_cast<unsigned long>(durationMs),
         current.isNull() ? "missing" : "present",
-        currentWeather.isNull() ? "missing" : "present");
+        daily.isNull() ? "missing" : "present");
     return false;
   }
 
   lockState();
   sharedState.weather.valid = true;
+  sharedState.weather.forecastValid = true;
   sharedState.weather.lastFetchOk = true;
   sharedState.weather.temperatureC = temperature;
   sharedState.weather.feelsLikeC = feelsLike;
+  sharedState.weather.minimumC = minimum;
+  sharedState.weather.maximumC = maximum;
+  sharedState.weather.uvIndexCurrent = uvIndexCurrent;
+  sharedState.weather.windMaxKph = windMaxKph;
+  sharedState.weather.windDirectionDeg =
+      static_cast<uint16_t>(windDirection % 360);
+  sharedState.weather.sunriseMin = sunriseMin;
+  sharedState.weather.sunsetMin = sunsetMin;
+  sharedState.weather.weatherCode =
+      static_cast<uint8_t>(weatherCode);
   copyText(
       sharedState.weather.observedAt,
       sizeof(sharedState.weather.observedAt),
       observedAt);
   sharedState.weather.receivedMs = millis();
+  sharedState.solar.valid = true;
+  sharedState.solar.lastFetchOk = true;
+  sharedState.solar.sunriseMin = sunriseMin;
+  sharedState.solar.sunsetMin = sunsetMin;
+  copyText(
+      sharedState.solar.date,
+      sizeof(sharedState.solar.date),
+      forecastDate);
+  sharedState.solar.receivedMs = sharedState.weather.receivedMs;
   unlockState();
   setAuxStatus(true, true);
   Serial.printf(
-      "[weather] temp=%.1fC feels=%.1fC\n",
+      "[weather] now=%.1fC feels=%.1fC min/max=%.1f/%.1fC "
+      "uv-now=%.1f wind=%.1fkm/h@%d rise=%02u:%02u set=%02u:%02u\n",
       temperature,
-      feelsLike);
+      feelsLike,
+      minimum,
+      maximum,
+      uvIndexCurrent,
+      windMaxKph,
+      windDirection,
+      sunriseMin / 60,
+      sunriseMin % 60,
+      sunsetMin / 60,
+      sunsetMin % 60);
   return true;
+}
+
+uint32_t weatherDelayAfterSuccess() {
+  constexpr uint32_t slotSeconds = WEATHER_REFRESH_MS / 1000UL;
+  const time_t wallClock = time(nullptr);
+  if (wallClock > 100000 && slotSeconds > 0) {
+    const uint32_t secondsIntoSlot =
+        static_cast<uint32_t>(wallClock) % slotSeconds;
+    const uint32_t secondsUntilNext = slotSeconds - secondsIntoSlot;
+    return secondsUntilNext * 1000UL + WEATHER_SLOT_GRACE_MS;
+  }
+  return WEATHER_REFRESH_MS;
+}
+
+uint32_t weatherRetryDelay(uint8_t retryStep) {
+  switch (retryStep) {
+    case 0:
+      return WEATHER_RETRY_INITIAL_MS;
+    case 1:
+      return 4UL * 60UL * 1000UL;
+    case 2:
+      return 8UL * 60UL * 1000UL;
+    default:
+      return WEATHER_RETRY_MAX_MS;
+  }
 }
 
 void networkTask(void *parameter) {
@@ -4414,20 +5352,18 @@ void networkTask(void *parameter) {
   uint32_t lastWifiAttemptMs = 0;
   uint32_t lastAlertPollMs = 0;
   uint32_t lastFlightPollMs = 0;
-  uint32_t lastSolarAttemptMs = 0;
   uint32_t lastHistoryAttemptMs = 0;
-  uint32_t lastWeatherAttemptMs = 0;
+  uint32_t nextWeatherPollMs = 0;
   uint32_t lastStatusMs = 0;
-  uint32_t lastWifiLogMs = 0;
-  bool lastSolarSuccess = false;
   bool lastHistorySuccess = false;
-  bool lastWeatherSuccess = false;
+  uint8_t weatherRetryStep = 0;
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
 
   for (;;) {
     const uint32_t nowMs = millis();
+    rtcNetworkHeartbeatMs = nowMs;
     const bool connected = WiFi.status() == WL_CONNECTED;
 
     if (!connected &&
@@ -4446,38 +5382,18 @@ void networkTask(void *parameter) {
       refreshNetworkStatus();
     }
 
-    if (lastWifiLogMs == 0 || nowMs - lastWifiLogMs >= WIFI_RETRY_MS) {
-      lastWifiLogMs = nowMs;
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf(
-            "[network] wifi=ok ip=%s rssi=%ld dBm\n",
-            WiFi.localIP().toString().c_str(),
-            static_cast<long>(WiFi.RSSI()));
-      } else {
-        Serial.printf(
-            "[network] wifi=down status=%d; retry=%lus\n",
-            static_cast<int>(WiFi.status()),
-            static_cast<unsigned long>(WIFI_RETRY_MS / 1000));
-      }
-    }
-
     if (connected) {
-      const uint32_t solarInterval =
-          lastSolarSuccess ? SOLAR_REFRESH_MS : SOLAR_RETRY_MS;
-      if (lastSolarAttemptMs == 0 ||
-          nowMs - lastSolarAttemptMs >= solarInterval) {
-        lastSolarAttemptMs = nowMs;
-        lastSolarSuccess = pollSolarTimes();
-      }
-
       if (lastAlertPollMs == 0 || nowMs - lastAlertPollMs >= ALERT_POLL_MS) {
-        lastAlertPollMs = nowMs;
         pollAlerts();
+        // Space requests from completion rather than their start. A slow or
+        // timed-out request must not trigger an immediate retry and overload
+        // an already struggling endpoint.
+        lastAlertPollMs = millis();
       }
 
       if (lastFlightPollMs == 0 || nowMs - lastFlightPollMs >= FLIGHT_POLL_MS) {
-        lastFlightPollMs = nowMs;
         pollFlights();
+        lastFlightPollMs = millis();
       }
 
       const uint32_t historyInterval =
@@ -4488,12 +5404,21 @@ void networkTask(void *parameter) {
         lastHistorySuccess = pollHistory();
       }
 
-      const uint32_t weatherInterval =
-          lastWeatherSuccess ? WEATHER_REFRESH_MS : WEATHER_RETRY_MS;
-      if (lastWeatherAttemptMs == 0 ||
-          nowMs - lastWeatherAttemptMs >= weatherInterval) {
-        lastWeatherAttemptMs = nowMs;
-        lastWeatherSuccess = pollWeather();
+      if (nextWeatherPollMs == 0 ||
+          static_cast<int32_t>(nowMs - nextWeatherPollMs) >= 0) {
+        const bool weatherSuccess = pollWeather();
+        const uint32_t completedMs = millis();
+        if (weatherSuccess) {
+          weatherRetryStep = 0;
+          nextWeatherPollMs = completedMs + weatherDelayAfterSuccess();
+        } else {
+          const uint32_t retryDelay = weatherRetryDelay(weatherRetryStep);
+          if (weatherRetryStep < 3) ++weatherRetryStep;
+          nextWeatherPollMs = completedMs + retryDelay;
+          Serial.printf(
+              "[weather] retry in %lumin\n",
+              static_cast<unsigned long>(retryDelay / 60000UL));
+        }
       }
     }
 
@@ -4507,6 +5432,22 @@ void networkTask(void *parameter) {
 void printBootDiagnostics() {
   Serial.println();
   Serial.println("Flight Above Head - ESP32-S3 desktop MVP");
+  Serial.printf(
+      "[boot] count=%lu persistent=%s uptime=%llus\n",
+      static_cast<unsigned long>(persistentBootCount),
+      bootCounterPersistent ? "yes" : "no",
+      static_cast<unsigned long long>(currentUptimeSeconds()));
+  Serial.printf(
+      "[boot] reset=%s(%d) previous-up~%lus panel-resume=%s\n",
+      resetReasonName(bootResetReason),
+      static_cast<int>(bootResetReason),
+      static_cast<unsigned long>(previousSessionUptimeSeconds),
+      panelResumeAfterReset ? "yes" : "no");
+  Serial.printf(
+      "[boot] previous-heartbeat main=%lums network=%lums render=%lums\n",
+      static_cast<unsigned long>(previousMainHeartbeatMs),
+      static_cast<unsigned long>(previousNetworkHeartbeatMs),
+      static_cast<unsigned long>(previousRenderHeartbeatMs));
   Serial.printf(
       "[boot] chip=%s rev=%u cores=%u cpu=%lu MHz\n",
       ESP.getChipModel(),
@@ -4545,14 +5486,21 @@ void printBootDiagnostics() {
 void printRuntimeDiagnostics() {
   const SharedState snapshot = copyState();
   const AppState appState = selectAppState(snapshot, millis());
-  const UBaseType_t networkStackWords =
+  // ESP-IDF returns the high-water mark in bytes, unlike upstream FreeRTOS.
+  const UBaseType_t loopStackBytes =
+      loopTaskHandle ? uxTaskGetStackHighWaterMark(loopTaskHandle) : 0;
+  const UBaseType_t networkStackBytes =
       networkTaskHandle ? uxTaskGetStackHighWaterMark(networkTaskHandle) : 0;
-  const UBaseType_t renderStackWords =
+  const UBaseType_t renderStackBytes =
       renderTaskHandle ? uxTaskGetStackHighWaterMark(renderTaskHandle) : 0;
 
+  Serial.println();
   Serial.printf(
-      "[diag] up=%lus state=%s mode=%s night-override=%s wifi=%s rssi=%ld ip=%s time=%s\n",
-      static_cast<unsigned long>(millis() / 1000),
+      "[diag] ================= SNAPSHOT boot=%lu up=%llus =================\n",
+      static_cast<unsigned long>(persistentBootCount),
+      static_cast<unsigned long long>(currentUptimeSeconds()));
+  Serial.printf(
+      "[diag][SYSTEM] state=%s mode=%s night-override=%s wifi=%s rssi=%ld ip=%s time=%s\n",
       appStateName(appState),
       visualModeName(snapshot.peripheral.visualMode),
       nightOverrideName(snapshot.peripheral.nightOverride),
@@ -4561,7 +5509,16 @@ void printRuntimeDiagnostics() {
       snapshot.status.ipAddress,
       snapshot.status.timeOk ? "ok" : "waiting");
   Serial.printf(
-      "[diag] api alert=%s req=%lu code=%d %lums; flight=%s req=%lu code=%d %lums; failures-total=%lu; streak n/t/f/a=%u/%u/%u/%u\n",
+      "[diag][RESET] cause=%s(%d) previous-up~%lus resumed=%s heartbeat main/network/render=%lu/%lu/%lums\n",
+      resetReasonName(bootResetReason),
+      static_cast<int>(bootResetReason),
+      static_cast<unsigned long>(previousSessionUptimeSeconds),
+      panelResumeAfterReset ? "yes" : "no",
+      static_cast<unsigned long>(previousMainHeartbeatMs),
+      static_cast<unsigned long>(previousNetworkHeartbeatMs),
+      static_cast<unsigned long>(previousRenderHeartbeatMs));
+  Serial.printf(
+      "[diag][API] alert=%s req=%lu code=%d %lums; flight=%s req=%lu code=%d %lums; failures-total=%lu; streak n/t/f/a=%u/%u/%u/%u\n",
       snapshot.status.alertOk ? "ok" : "fail",
       static_cast<unsigned long>(snapshot.metrics.alertRequests),
       snapshot.metrics.lastAlertHttpCode,
@@ -4576,7 +5533,7 @@ void printRuntimeDiagnostics() {
       static_cast<unsigned>(snapshot.status.flightFailures),
       static_cast<unsigned>(snapshot.status.alertFailures));
   Serial.printf(
-      "[diag] solar=%s last=%s code=%d %lums date=%s rise=%02u:%02u set=%02u:%02u req=%lu fail=%lu\n",
+      "[diag][SOLAR] state=%s last=%s code=%d %lums date=%s rise=%02u:%02u set=%02u:%02u req=%lu fail=%lu\n",
       snapshot.solar.valid ? "valid" : "fallback",
       snapshot.solar.lastFetchOk ? "ok" : "fail",
       snapshot.metrics.lastSolarHttpCode,
@@ -4589,7 +5546,7 @@ void printRuntimeDiagnostics() {
       static_cast<unsigned long>(snapshot.metrics.solarRequests),
       static_cast<unsigned long>(snapshot.metrics.solarFailures));
   Serial.printf(
-      "[diag] history=%s code=%d %lums req=%lu fail=%lu latest=%s; weather=%s code=%d %lums %.1fC feels=%.1fC req=%lu fail=%lu streak h/w=%u/%u\n",
+      "[diag][AUX] history=%s code=%d %lums req=%lu fail=%lu latest=%s; weather=%s code=%d %lums %.1fC feels=%.1fC req=%lu fail=%lu streak h/w=%u/%u\n",
       snapshot.status.historyOk ? "ok" : "fail",
       snapshot.metrics.lastHistoryHttpCode,
       static_cast<unsigned long>(snapshot.metrics.lastHistoryDurationMs),
@@ -4606,7 +5563,24 @@ void printRuntimeDiagnostics() {
       static_cast<unsigned>(snapshot.status.historyFailures),
       static_cast<unsigned>(snapshot.status.weatherFailures));
   Serial.printf(
-      "[diag] display ready=%s panel=%s screen=%s refresh=%uHz brightness=%u(%s) frames=%lu last-render=%luus signature=%08lx\n",
+      "[diag][FORECAST] valid=%s min/max=%.1f/%.1fC uv=%.1f "
+      "wind=%.1fkm/h@%u rise=%02u:%02u set=%02u:%02u code=%u "
+      "open-meteo req/fail=%lu/%lu\n",
+      snapshot.weather.forecastValid ? "yes" : "no",
+      snapshot.weather.minimumC,
+      snapshot.weather.maximumC,
+      snapshot.weather.uvIndexCurrent,
+      snapshot.weather.windMaxKph,
+      static_cast<unsigned>(snapshot.weather.windDirectionDeg),
+      snapshot.weather.sunriseMin / 60,
+      snapshot.weather.sunriseMin % 60,
+      snapshot.weather.sunsetMin / 60,
+      snapshot.weather.sunsetMin % 60,
+      static_cast<unsigned>(snapshot.weather.weatherCode),
+      static_cast<unsigned long>(snapshot.metrics.openMeteoRequests),
+      static_cast<unsigned long>(snapshot.metrics.openMeteoFailures));
+  Serial.printf(
+      "[diag][DISPLAY] ready=%s panel=%s screen=%s refresh=%uHz brightness=%u(%s) frames=%lu last-render=%luus signature=%08lx\n",
       displayReady ? "yes" : "no",
       snapshot.peripheral.panelEnabled ? "on" : "off",
       screenOverrideName(snapshot.peripheral.screenOverride),
@@ -4619,15 +5593,16 @@ void printRuntimeDiagnostics() {
       static_cast<unsigned long>(snapshot.metrics.lastRenderDurationUs),
       static_cast<unsigned long>(snapshot.metrics.lastRenderSignature));
   Serial.printf(
-      "[diag] memory heap=%lu min=%lu max-block=%lu psram-free=%lu; stack-free network=%uB render=%uB\n",
+      "[diag][MEMORY] heap=%lu min=%lu max-block=%lu psram-free=%lu; stack-free loop=%uB network=%uB render=%uB\n",
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getMinFreeHeap()),
       static_cast<unsigned long>(ESP.getMaxAllocHeap()),
       static_cast<unsigned long>(ESP.getFreePsram()),
-      static_cast<unsigned>(networkStackWords * sizeof(StackType_t)),
-      static_cast<unsigned>(renderStackWords * sizeof(StackType_t)));
+      static_cast<unsigned>(loopStackBytes),
+      static_cast<unsigned>(networkStackBytes),
+      static_cast<unsigned>(renderStackBytes));
   Serial.printf(
-      "[diag] sensor bh1750=%s addr=0x%02X lux=%.1f auto=%s; button=%lu saver=%s/%u\n",
+      "[diag][SENSORS] bh1750=%s addr=0x%02X lux=%.1f auto=%s; button=%lu saver=%s/%u\n",
       snapshot.peripheral.lightOk ? "ok" : "missing",
       snapshot.peripheral.bh1750Address,
       snapshot.peripheral.ambientLux,
@@ -4637,8 +5612,10 @@ void printRuntimeDiagnostics() {
       static_cast<unsigned>(snapshot.peripheral.screensaverIndex + 1));
 
   if (snapshot.status.lastError[0] != '\0') {
-    Serial.printf("[diag] last-error=%s\n", snapshot.status.lastError);
+    Serial.printf("[diag][ERROR] %s\n", snapshot.status.lastError);
   }
+  Serial.println("[diag] ================================================================");
+  Serial.println();
 }
 
 void processSerialCommand(char *command) {
@@ -4693,6 +5670,7 @@ void processSerialCommand(char *command) {
       lockState();
       sharedState.peripheral.panelEnabled = enabled;
       unlockState();
+      rememberPanelArmed(enabled);
       Serial.printf("[command] panel=%s\n", enabled ? "on" : "off");
       return;
     }
@@ -4869,6 +5847,8 @@ void setup() {
     return;
   }
 
+  initializeResetRecovery();
+  initializeBootCounter();
   restoreUiSelection();
   printBootDiagnostics();
   pinMode(
@@ -4883,7 +5863,13 @@ void setup() {
       "[display] waiting %lums for panel power\n",
       static_cast<unsigned long>(PANEL_POWER_SETTLE_MS));
   delay(PANEL_POWER_SETTLE_MS);
-  Serial.println("[display] standby; press the button to start HUB75");
+  if (panelResumeAfterReset) {
+    Serial.printf(
+        "[display] recovering armed panel after %s reset\n",
+        resetReasonName(bootResetReason));
+  } else {
+    Serial.println("[display] standby; press the button to start HUB75");
+  }
   setupTime();
 
   const BaseType_t networkCreated = xTaskCreatePinnedToCore(
@@ -4904,16 +5890,19 @@ void setup() {
       RENDER_TASK_CORE);
 
   Serial.printf(
-      "[boot] tasks network=%s(core %d) render=%s(core %d)\n",
+      "[boot] tasks network=%s(core %d prio=%u) render=%s(core %d prio=%u)\n",
       networkCreated == pdPASS ? "ok" : "FAILED",
       NETWORK_TASK_CORE,
+      static_cast<unsigned>(NETWORK_TASK_PRIORITY),
       renderCreated == pdPASS ? "ok" : "FAILED",
-      RENDER_TASK_CORE);
+      RENDER_TASK_CORE,
+      static_cast<unsigned>(RENDER_TASK_PRIORITY));
 }
 
 void loop() {
   static uint32_t lastDiagnosticsMs = 0;
   const uint32_t nowMs = millis();
+  rtcMainHeartbeatMs = nowMs;
 
   handleTouchButton(nowMs);
   updateLightSensor(nowMs);

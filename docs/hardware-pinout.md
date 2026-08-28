@@ -4,6 +4,11 @@ This is the wiring target for the photographed HW678 V0.0.0 board and the
 K716-128x64-32S-V3.3 HUB75E panel. The mapping avoids pins that can interfere
 with boot, Octal PSRAM, native USB, UART0, or the onboard RGB LED.
 
+![Verified HUB75 wiring reference](../HUB75_pins.jpeg)
+
+The image is a connector reference only. Always follow the silk-screen signal
+names on the actual panel; HUB75 connector orientation varies between vendors.
+
 ## HUB75E wiring
 
 | HUB75 signal | ESP32-S3 GPIO | Previous GPIO |

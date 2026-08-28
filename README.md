@@ -1,248 +1,451 @@
-# Flight Above Head v1.0
+# Flight Above Head
 
-Autonomous ESP32-S3/HUB75 desktop display for overhead aircraft, high-priority
-alerts, time, weather, and calm ambient clock screens.
+An autonomous 128×64 HUB75 desktop display built around an ESP32-S3. It shows
+aircraft passing over a fixed location, high-priority alerts, local time and
+weather, and a set of deliberately calm ambient screensavers.
 
-Version 1.0 targets the K716 128x64 1/32-scan panel and ESP32-S3-N16R8. Network
-requests and rendering run on separate FreeRTOS cores, complete frames are
-published through double-buffered DMA, and unchanged static content is not
-redrawn. The fixed priority is `ALERT > AIRCRAFT > selected UI`.
+The firmware is designed for unattended 24/7 operation. Network requests and
+rendering run on separate ESP32-S3 cores, the panel is scanned continuously by
+DMA, complete frames are swapped atomically, and unchanged static screens are
+not redrawn. Runtime priority is always:
 
-After power-up the controller, Wi-Fi, APIs, clock, and sensors start in the
-background while HUB75 remains electrically blank and its DMA driver is not
-initialized. The first touch starts the panel and reveals the last saved UI
-page through the boot animation; that wake-up touch is not treated as a page
-change, double tap, or brightness command.
+```text
+ALERT > LIVE AIRCRAFT > selected user interface
+```
 
-Release history is maintained in [`CHANGELOG.md`](CHANGELOG.md). Runtime and
-wiring details live under [`docs/`](docs/).
+This repository contains the hardware-tested firmware and documentation. It
+does **not** contain Wi-Fi credentials, API keys, or installation coordinates.
+See [Security and privacy](#security-and-privacy) before making a fork public.
 
-## Hardware
+## What it does
 
-- Controller: ESP32-S3-N16R8 / HW678 V0.0.0
-- Panel: K716-128x64-32S-V3.3, HUB75E, 128x64, 1/32 scan
-- Brightness sensor: BH1750, SDA GPIO1, SCL GPIO2, address auto-detected at
-  `0x23` or `0x5C`
-- Touch module: TTP223-compatible digital output on GPIO18
+- Polls live aircraft, retained aircraft history, and alert endpoints.
+- Displays callsign, route, altitude, speed, and heading for live and last
+  aircraft.
+- Synchronizes local time over NTP using the Israel daylight-saving rules.
+- Fetches current weather, apparent temperature, current UV, daily min/max,
+  wind, sunrise, and sunset from Open-Meteo.
+- Uses sunrise/sunset plus BH1750 illumination to select DAY, NIGHT, and SLEEP
+  visual modes.
+- Keeps alerts bright even when the rest of the panel is in sleep mode.
+- Provides fourteen low-distraction DMA/GFX screensavers.
+- Supports a fast touch-button UI and a non-blocking Serial control console.
+- Retains the selected UI, boot count, reset diagnostics, and the last aircraft.
+- Shows small delayed health indicators only after repeated service failures.
 
-The verified safe wiring for this N16R8 board is documented in
-[`docs/hardware-pinout.md`](docs/hardware-pinout.md). The previous wiring used
-boot-strapping pins GPIO3/45/46 and Octal-PSRAM pins GPIO35/37; do not use that
-older mapping on this module.
+## Reference hardware
 
-## Build
+The tested build uses:
 
-Open `FlightAboveHead/FlightAboveHead.ino` in Arduino IDE. For the photographed
-N16R8 board, use:
+| Part | Tested hardware | Notes |
+| --- | --- | --- |
+| MCU | ESP32-S3-N16R8, HW-678 V0.0.0 | 16 MB flash, 8 MB Octal PSRAM, dual core |
+| LED panel | K716-128x64-32S-V3.3 | HUB75E, 128×64, 1/32 scan |
+| Light sensor | BH1750 breakout | I²C address `0x23` or `0x5C` |
+| Touch input | TTP223-compatible module | Momentary active-HIGH digital output |
+| Panel supply | Regulated 5 V supply | Size for the panel manufacturer's maximum current |
 
-- Board: `ESP32S3 Dev Module`
-- Flash size: `16MB`
-- PSRAM: `OPI PSRAM`
-- Flash mode: `QIO 80MHz`
+The BH1750 and touch module are optional. Without a BH1750, the firmware uses
+fixed brightness fallbacks. Without the touch module, the panel can be started
+and controlled through Serial commands.
 
-Required libraries:
+### Compatible alternatives
 
-- `ESP32-HUB75-MatrixPanel-DMA`
-- `ArduinoJson`
+The firmware should also work with another ESP32-S3 board when it has:
 
-No external BH1750 library is required; the sketch uses the built-in `Wire`
-library and the sensor's documented I2C commands directly.
+- two application cores;
+- PSRAM that supports the HUB75 DMA buffers (the reference build expects OPI
+  PSRAM);
+- at least fourteen available output GPIOs for HUB75E plus any desired sensor
+  pins;
+- a native or UART serial path for upload and diagnostics.
 
-Before network stages, copy `FlightAboveHead/secrets.example.h` to `FlightAboveHead/secrets.h` and fill local Wi-Fi credentials. `secrets.h` is ignored by Git.
+Other 128×64 HUB75E 1/32-scan panels are the easiest substitutions. A panel
+with a different resolution, scan pattern, E-address requirement, signal
+polarity, or color wiring needs corresponding changes to the constants and
+driver configuration near the top of
+[`FlightAboveHead.ino`](FlightAboveHead.ino). The tested panel
+uses the unusual `BRG` color correction; conventional RGB panels should use
+`PanelColorOrder::RGB`.
 
-HUB75 pin constants are intentionally kept at the top of
-`FlightAboveHead/FlightAboveHead.ino`. Keep them synchronized with
-`docs/hardware-pinout.md` if the wiring changes.
+Classic ESP32, ESP32-C3, ESP32-S2, and ESP32-S3 boards without suitable PSRAM
+are not drop-in replacements for this configuration. They may require a
+different driver backend, framebuffer layout, pin map, or reduced color depth.
 
-API endpoints are configured in `FlightAboveHead/api_config.h`. The current
-profile reads live flights, flight history, and alerts from
-`roshpinaoverhead.online`. On startup, the newest history item restores the
-`LAST AIRCRAFT` page even before another aircraft flies overhead.
+## GPIO layout
 
-The same file contains the fixed installation coordinates. Sunrise, sunset,
-current outdoor temperature, and apparent temperature are fetched from the
-keyless Open-Meteo API in the `Asia/Jerusalem` timezone. The last successful
-values remain active across temporary request failures; before the first
-successful solar response the firmware safely falls back to `06:00` sunrise
-and `19:00` sunset.
+This mapping is verified on the photographed ESP32-S3-N16R8/HW-678 carrier. Do
+not assume that header labels imply a GPIO is free on another carrier board.
 
-Do not remove `FlightAboveHead/build_opt.h`. It places the two HUB75 DMA frame
-buffers in the N16R8 module's Octal PSRAM. Selecting anything other than
-`OPI PSRAM` makes display initialization fail with an explicit serial message.
+### HUB75E
 
-## Runtime profile
+| HUB75 signal | ESP32-S3 GPIO | HUB75 signal | ESP32-S3 GPIO |
+| --- | ---: | --- | ---: |
+| R1 | 4 | R2 | 7 |
+| G1 | 5 | G2 | 8 |
+| B1 | 6 | B2 | 9 |
+| A | 10 | B | 11 |
+| C | 12 | D | 13 |
+| E | 14 | LAT / STB | 15 |
+| OE | 16 | CLK | 17 |
+| GND | GND |  |  |
 
-- Fixed fallback: idle `24`, aircraft `140`, screensaver `140`, alert `255`
-- Button-selected manual brightness: `200`
-- Automatic idle range: `1–52`
-- Automatic aircraft range: `3–160`
-- Automatic alert range: `150–255`
-- Automatic daytime screensaver range: `3–160`
-- Night ranges: idle `1–20`, screensaver `1–24`, aircraft `1–24`
-- Sleep levels: idle `1`, screensaver `1`, aircraft `1`
-- Six-bit panel color depth
-- Minimum requested refresh: 120 Hz
-- Double DMA buffer in Octal PSRAM
-- Network task: core 0
-- Render task: core 1
-- Wi-Fi power saving disabled for predictable request latency
+### Sensors and input
 
-The idle screen contains a larger bold centered clock and a brighter small date. Its
-colon completes one subtle sinusoidal brightness breath per second at 25
-animation steps per second. Aircraft and alert layouts use short centered rows.
-Unavailable dependencies appear in the top-right corner only while unhealthy:
-`N` network, `F` flight source, `A` alert source, `H` history, `W` weather,
-and `T` time sync. A symbol is
-shown only after three consecutive failed checks; a successful check clears it
-immediately. This prevents one-second Wi-Fi or API interruptions from flashing
-on an otherwise calm desktop screen.
+| Device | Signal | ESP32-S3 GPIO |
+| --- | --- | ---: |
+| BH1750 | SDA | 1 |
+| BH1750 | SCL | 2 |
+| TTP223 | OUT | 18 |
 
-The render task hashes only visible state. Repeated API responses with identical
-content do not touch the framebuffer. Only the idle colon and an active
-screensaver deliberately request timed animation frames. See
-[`docs/runtime-architecture.md`](docs/runtime-architecture.md).
+Power the BH1750 and TTP223 from **3.3 V**, not 5 V, and connect all grounds.
+The firmware probes both legal BH1750 addresses. The TTP223 input defaults to
+active HIGH; change `TOUCH_BUTTON_ACTIVE_HIGH` for an active-LOW module.
 
-At 115200 baud, serial diagnostics are printed at boot and every five seconds
-while a Serial Monitor is connected.
-They include Wi-Fi/IP/RSSI, API counts and latency, HTTP codes, refresh rate,
-frame count, heap/PSRAM, visual mode, sunrise/sunset, solar refresh state, and
-task stack headroom. The network task additionally
-prints `wifi=ok` or `wifi=down` every ten seconds so connection state remains
-visible even when the monitor misses the initial transition.
-USB CDC writes use a zero timeout, so closing Arduino IDE or leaving its monitor
-idle cannot block the button, BH1750 sampling, or network health updates.
+The mapping intentionally avoids boot-strapping pins, native USB, UART0, Octal
+PSRAM, and the onboard RGB LED. See
+[`docs/hardware-pinout.md`](docs/hardware-pinout.md) for the reserved-pin
+rationale, peripheral wiring, power notes, and signal-integrity guidance.
 
-The Serial Monitor also exposes a non-blocking runtime control console:
+## Electrical safety and panel power
+
+HUB75 panels are not powered through the ESP32 board.
+
+1. Use a dedicated regulated 5 V supply sized for the panel's worst-case draw.
+2. Join the panel-supply ground, panel ground, and ESP32 ground.
+3. Use short, adequately thick power conductors and an appropriate fuse.
+4. Wire or disconnect the ribbon cable only while both devices are unpowered.
+5. If signal integrity is poor, use a 74AHCT245/74HCT245-style 3.3-to-5 V level
+   shifter close to the panel input.
+
+High brightness can draw several amperes depending on the panel. Confirm the
+actual panel specification instead of sizing the supply from average desktop
+brightness.
+
+## Software requirements
+
+The release is built and tested with:
+
+| Component | Tested version |
+| --- | ---: |
+| Arduino IDE | 2.x |
+| Espressif `arduino-esp32` core | 3.3.11 |
+| ESP32 HUB75 LED Matrix Panel DMA Display | 3.0.14 |
+| ArduinoJson | 7.4.3 |
+| Adafruit GFX Library | 1.12.6 |
+
+`Wire`, `WiFi`, `HTTPClient`, and `Preferences` come from the ESP32 Arduino
+core. No external BH1750 library is needed.
+
+Install the ESP32 core through Arduino Boards Manager using Espressif's package
+index:
+
+```text
+https://espressif.github.io/arduino-esp32/package_esp32_index.json
+```
+
+Install the three user libraries above through Library Manager. The HUB75
+library's upstream repository is
+[`mrcodetastic/ESP32-HUB75-MatrixPanel-DMA`](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA).
+
+## Local configuration
+
+Two local files are deliberately ignored by Git.
+
+### 1. Wi-Fi credentials
+
+Copy the example beside the sketch:
+
+```bash
+cp secrets.example.h secrets.h
+```
+
+Edit only the copied file:
+
+```cpp
+constexpr const char *WIFI_SSID = "your-wifi-ssid";
+constexpr const char *WIFI_PASSWORD = "your-wifi-password";
+```
+
+### 2. Installation coordinates
+
+Copy the location template:
+
+```bash
+cp location.example.h location.h
+```
+
+Set latitude and longitude for the installation:
+
+```cpp
+#define HOME_LATITUDE 00.000000
+#define HOME_LONGITUDE 00.000000
+```
+
+Exact home coordinates are treated as private configuration even though
+Open-Meteo itself is keyless. A build without `location.h` still compiles for
+CI, but deliberately disables weather and solar polling: it never requests a
+misleading `0,0` placeholder location.
+
+API endpoints are public configuration in
+[`api_config.h`](api_config.h). The default profile uses the
+project's public AirPlaneTracker endpoints. A self-hosted or adapted project
+can replace these URLs as long as it preserves the documented JSON shape in
+[`docs/api-observations.md`](docs/api-observations.md).
+
+## Arduino IDE build and upload
+
+Open [`FlightAboveHead.ino`](FlightAboveHead.ino) in Arduino
+IDE and select the following Tools settings for ESP32-S3-N16R8:
+
+| Arduino Tools option | Value |
+| --- | --- |
+| Board | `ESP32S3 Dev Module` |
+| USB CDC On Boot | `Enabled` |
+| CPU Frequency | `240MHz (WiFi)` |
+| Core Debug Level | `None` for release; `Info` only while diagnosing core issues |
+| Events Run On | `Core 1` |
+| Flash Mode | `QIO 80MHz` |
+| Flash Size | `16MB (128Mb)` |
+| Arduino Runs On | `Core 1` |
+| Partition Scheme | `16M Flash (3MB APP/9.9MB FATFS)` |
+| PSRAM | `OPI PSRAM` |
+| Upload Mode | `UART0 / Hardware CDC` |
+| Upload Speed | `921600` (`460800` or `115200` if unreliable) |
+| USB Mode | `Hardware CDC and JTAG` |
+
+Do not remove [`build_opt.h`](build_opt.h). It defines
+`SPIRAM_DMA_BUFFER=1`, allowing the two HUB75 DMA buffers to use the N16R8
+Octal PSRAM. If `OPI PSRAM` is not selected, display initialization stops with
+a clear Serial error.
+
+Select the USB serial port, click **Upload**, then open Serial Monitor at
+`115200 baud` with a newline line ending. If upload stalls, hold BOOT, tap RST,
+start upload, and release BOOT when the connection begins.
+
+### Arduino CLI build
+
+For repeatable local or CI builds:
+
+```bash
+arduino-cli core install esp32:esp32@3.3.11
+arduino-cli lib install \
+  "ESP32 HUB75 LED MATRIX PANEL DMA Display@3.0.14" \
+  "ArduinoJson@7.4.3" \
+  "Adafruit GFX Library@1.12.6"
+
+arduino-cli compile \
+  --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,USBMode=hwcdc,CDCOnBoot=cdc' \
+  .
+```
+
+The repository CI uses a secret-free placeholder build. Real credentials and
+coordinates are never required by GitHub Actions.
+
+## First boot and deployment
+
+1. Power the ESP32 and panel, preferably with the panel supply already stable.
+2. The controller starts Wi-Fi, NTP, APIs, BH1750, and the touch service while
+   keeping HUB75 electrically blank.
+3. Press the touch button once, or send `panel on`, to initialize DMA and start
+   the panel. This first touch is consumed and does not change screens.
+4. Confirm `[display] ready`, `wifi=ok`, `time=ok`, and the expected GPIO map in
+   Serial Monitor.
+5. Send `test` to inspect BH1750, button, panel, and current brightness.
+6. Leave `screen auto`, `night auto`, and `brightness auto` for normal service.
+
+After this deliberate cold-start arming, software, watchdog, brownout, and RST
+restarts automatically restore the panel. A genuine power loss intentionally
+returns to button-waiting standby. `panel off` explicitly disarms it.
+
+## Touch controls
+
+| Gesture | Action |
+| --- | --- |
+| First touch after cold power-up | Start HUB75; gesture is consumed |
+| Short touch | Enter screensavers or select the next screensaver |
+| Double touch within 280 ms | Open/close the retained last-aircraft screen |
+| Double touch while a live aircraft is shown | Acknowledge that aircraft and return to the selected screensaver |
+| Long touch | Toggle BH1750 auto brightness and manual `200/255` |
+
+The GPIO is sampled every millisecond with fast-pulse latching, so short TTP223
+pulses are not intentionally filtered out.
+Acknowledging a live aircraft suppresses only its current identity. A different
+aircraft is still shown immediately, and a successful empty live response
+clears the acknowledgement for a later encounter. Active alerts cannot be
+dismissed by the button.
+
+## Serial console
+
+Serial output and commands use `115200 baud`. Logging has a zero USB CDC write
+timeout; disconnecting Arduino IDE cannot block the panel, button, or network
+tasks.
 
 ```text
 panel on | panel off
 brightness auto | fixed | 0..255
 screen auto | idle | last | aircraft | test | saver | alert
-saver next | saver 1..12
+saver next | saver 1..14
 night auto | night on | night off
 test | status | diag | help
 ```
 
-`brightness auto` returns control to BH1750, `fixed` uses state fallback
-levels, and a numeric value applies an exact global DMA brightness. A forced
-`screen` is intended for visual testing, but a real aircraft or alert still
-retains safety priority. `screen auto` returns to button-selected UI state.
-`panel off` blanks output without stopping
-Wi-Fi, API polling, sensors, or the console. If DMA has not yet been started,
-`panel on` performs the same deferred initialization as the first button touch.
+- `panel off` blanks output but leaves networking, APIs, sensors, and Serial
+  alive.
+- `brightness auto` uses BH1750; `fixed` selects state fallbacks; a number sets
+  exact manual DMA brightness.
+- `screen ...` forces a page for visual testing. Real alert and aircraft safety
+  priority remains active. Use `screen auto` to release the override.
+- `night on` forces NIGHT, `night off` forces DAY, and `night auto` returns to
+  sunrise/sunset control.
+- `status` and `diag` print an immediate diagnostic snapshot.
 
-## Light sensor and touch test
+## Reading the logs
 
-BH1750 is sampled once per second. The measured value is smoothed and passed
-through a logarithmic curve spanning darkness through 350 lux. At approximately
-228 lux the target is about 46 for idle, 142 for aircraft/screensavers, and
-243 for alerts;
-near 1 lux the corresponding targets are about 3, 43, and 153. If the sensor is
-absent, fixed fallback values remain active. Both legal BH1750 addresses are
-detected automatically, and recovery is attempted every five seconds.
-Flight and alert strings are filtered to the printable ASCII supported by the
-built-in GFX font. UTF-8 placeholders such as an em dash no longer turn into
-garbled multi-character glyphs; missing fields use explicit English fallbacks.
+Boot messages describe configuration and the previous reset before periodic
+diagnostics begin:
 
-A first touch wakes a panel that is still in startup standby. Once awake, a
-short touch immediately enters screensaver mode; subsequent short touches
-advance to the next effect. If a second touch arrives within 280 ms, the first
-action is rolled back to an exact saved state and the pair opens the retained
-`LAST AIRCRAFT` page. Another double touch returns to idle. Pulses as short as
-1 ms are latched separately so a very quick fingertip touch is not discarded
-by debounce. There are twelve
-restrained effects:
+```text
+[boot]       chip, flash, PSRAM, reset recovery, GPIO, task creation
+[display]    standby, DMA initialization, refresh rate, allocation failures
+[sensor]     BH1750 detection, address, readings, recovery
+[network]    Wi-Fi connection transitions and retry activity only
+[weather]    accepted Open-Meteo values and bounded retry schedule
+[history]    retained aircraft history refresh
+[button]     decoded touch gestures
+[command]    accepted Serial commands
+[error]      HTTP, JSON, or service errors
+[fatal]      unrecoverable setup allocation failures
+```
 
-1. split-screen radar with clock and an NTP-synchronized, microsecond-smoothed
-   seconds-hand sweep with a fading trail; a hidden target becomes visible
-   only while the beam crosses its angle, then fades continuously for exactly
-   63 seconds;
-2. continuous thick wave with a centered clock; its wavelength and speed
-   follow the time of day and become long and calm by 22:00;
-3. fire whose daytime flames are tall and gradually subside toward evening;
-4. eight sharper full-panel metaballs with a continuous full-spectrum color
-   cycle and a bold compact rounded clock on a transparent background;
-5. subpixel-smoothed expanding rings with a low-amplitude gravitational
-   contraction front that reaches successive rings quickly and releases each
-   one smoothly at every new minute;
-6. a larger head-on antialiased aircraft bouncing around the panel; an exact
-   corner hit unlocks a 30-second `- Yes, That just happened.` message;
-7. weather clock with a rounded digital face, date, temperature, and apparent
-   temperature;
-8. centered rounded clock with a clockwise 60-minute fill; the sector stays
-   still within a minute and smoothly fills exactly one additional minute at
-   second `00` without a backward recoil; during `59:59` the full sector
-   clears smoothly and reaches the empty state exactly at `00:00`;
-9. four-card flip clock with shaded top/bottom faces and perspective folding;
-10. second-accurate analog clock with discrete second/minute movement and a
-    thick top-view aircraft crossing the exact center in a random direction
-    at `00:00`;
-11. a gently drifting, unlit and engine-free aircraft silhouette flying
-    through a restrained star field, with a tiny drop event at `16:20`;
-12. a fixed TomThumb matrix of letters, digits, and symbols with many
-    independently falling column highlights and medium trails; every leading
-    glyph uses the secondary color, and the matrix includes a hidden
-    horizontal `Nice` behind the large outlined clock.
+Every five seconds, a divided snapshot reports:
 
-A long touch switches between BH1750 automatic brightness and exact manual
-`200/255` brightness. Alerts keep their separate high-priority `150–255`
-automatic range and are not reduced by the manual setting. Screensaver uses the
-same daytime automatic `3–160` profile as the aircraft page (about `142/255`
-around 228 lux), while the
-existing `1–24` night range keeps it near-black after sunset.
+```text
+[diag][SYSTEM]    boot/uptime, UI state, DAY/NIGHT/SLEEP, Wi-Fi, RSSI, IP, NTP
+[diag][RESET]     prior reset cause and retained loop/network/render heartbeats
+[diag][API]       alert/flight health, HTTP status, latency, request counters
+[diag][SOLAR]     sunrise/sunset snapshot and refresh result
+[diag][AUX]       history and weather health
+[diag][FORECAST]  weather values and actual Open-Meteo call/failure counts
+[diag][DISPLAY]   panel state, refresh rate, brightness, frames, render time
+[diag][MEMORY]    heap, largest block, PSRAM, and task stack headroom
+[diag][SENSORS]   BH1750 state/lux, auto brightness, button count, saver index
+[diag][ERROR]     most recent retained error, when present
+```
 
-The effects are lightweight implementations inspired by HUB75 DMA/Aurora
-examples and restrained clock displays. They use a dynamic 1–50 fps render cadence,
-draw directly through the existing DMA/GFX interface, and do not add its
-GFX_Lite/FastLED dependency.
-Every effect receives the same global DMA brightness selected for the current
-DAY/NIGHT/SLEEP mode; there are no per-effect brightness overrides. Color
-variation belongs to the artwork, not to panel output intensity.
-Live aircraft and alerts override menu pages, button-driven screensavers, and
-diagnostic Serial screens. The fixed priority is always
-`ALERT > AIRCRAFT > selected UI`.
+HTTP `-11` means a read timeout, while `-1` commonly means connection refused
+or no route. One failure is not necessarily a firmware fault: health glyphs are
+shown only after repeated failures, and last-good data is retained. Use the
+HTTP code, request duration, RSSI, free heap, stack headroom, and reset cause
+together rather than diagnosing from a single line.
 
-The physically selected UI page and screensaver number are saved in ESP32 NVS
-only when they change. After a power loss the panel restores that page instead
-of always returning to the first screen; animation frames never write flash.
+See [`docs/troubleshooting.md`](docs/troubleshooting.md) for upload, blank-panel,
+color, flicker, sensor, network, watchdog, and reset procedures.
 
-After the first wake touch, the restored screensaver is rendered behind a solid
-accent canvas. A top-view aircraft cuts through that canvas, then both feathered
-halves move apart to reveal the already-running saved effect. The intro is
-non-blocking: network and sensor work continues normally.
+## Network behavior and external services
 
-## Day, night, and sleep
+- Alerts: every 3 seconds, measured from request completion, 12-second timeout.
+- Live flights: every 5 seconds, measured from completion, 5-second timeout.
+- History: every 5 minutes; failure retry every 30 seconds.
+- Open-Meteo: one combined current/daily request per 15-minute model slot,
+  normally about 96 calls/day, with 2/4/8/15-minute failure backoff.
+- Wi-Fi power saving is disabled to make request latency predictable.
+- NTP uses `pool.ntp.org` and `time.google.com`.
 
-`DAY` changes to a warm `NIGHT` theme at the current day's sunset and returns
-at sunrise. Solar times are refreshed after connection and every six hours;
-failed refreshes retry every ten minutes without discarding the last good
-schedule. If BH1750 remains at or below `1 lux` for 60 seconds during the
-night, `SLEEP` caps idle and screensaver output at `1/255` and aircraft at
-`1/255`. It exits after 30 seconds at or above `3 lux`, or immediately at
-sunrise. These delays prevent a hand shadow or a brief light change from
-switching modes.
+Open-Meteo is used only for a personal non-commercial deployment under its
+[usage terms](https://open-meteo.com/en/terms). Adaptors must review the terms
+for their own deployment. The firmware retains previous successful weather,
+solar, history, aircraft, and alert data through brief outages.
 
-Alerts never inherit the warm theme or sleep caps: their automatic brightness
-continues to use the prominent `150–255` range.
+## Brightness and visual modes
 
-For debugging from Serial Monitor, send `night on` to force NIGHT, `night off`
-to force DAY, and `night auto` to return to sunrise/sunset control. The `test`
-command opens the eight-second sensor diagnostic page; `help` lists commands.
+BH1750 is sampled once per second, smoothed, and passed through a logarithmic
+curve. Daytime aircraft and screensavers target `3–160/255`; alerts target
+`150–255/255`. NIGHT begins at fetched sunset and applies a warm theme. During
+NIGHT, 60 seconds at or below 1 lux enters SLEEP; 30 seconds at or above 3 lux
+exits it. Alerts never inherit the low sleep cap.
 
-## High-brightness power
+All screensavers share the same global state brightness. Their drawing cadence
+is dynamic (roughly 1–50 fps) while the hardware HUB75 scan remains continuous
+and safely above 120 Hz. Details of task ownership, state hashing, transitions,
+and all fourteen effects are in
+[`docs/runtime-architecture.md`](docs/runtime-architecture.md).
 
-Use a dedicated regulated 5 V panel supply sized for the panel manufacturer's
-maximum-current specification. Never route panel current through the ESP32
-board. Use short, sufficiently thick power wires, a common ground, and a fuse
-appropriate for the supply and wiring.
+## Security and privacy
 
-## MVP Order
+Before publishing a fork:
 
-1. Panel and color test
-2. Wi-Fi and NTP
-3. Alert API
-4. Flight API
-5. State machine
-6. BH1750 automatic brightness
-7. Button debounce and press handling
-8. Resilience and long-running test
+- verify `secrets.h` and `location.h` are
+  ignored and untracked;
+- never paste Serial output containing private SSIDs or infrastructure URLs;
+- inspect photos for EXIF GPS metadata;
+- review public API URLs and confirm you are allowed to redistribute/use them;
+- run the tracked-file secret scan from the release checklist;
+- do not commit Arduino build outputs, core dumps, or raw long-running logs.
+
+The included panel pinout image contains no camera make/model or GPS metadata.
+See [`docs/release-checklist.md`](docs/release-checklist.md) for the full audit.
+
+## Repository map
+
+```text
+FlightAboveHead.ino         firmware
+api_config.h                public service endpoints + private-location loader
+build_opt.h                 PSRAM DMA compile option
+secrets.example.h           Wi-Fi template
+location.example.h          private-coordinate template
+open_meteo_ca.h             pinned public CA for authenticated Open-Meteo TLS
+docs/
+  hardware-pinout.md        wiring, reserved pins, power, color order
+  runtime-architecture.md   tasks, state priority, rendering, resilience
+  api-observations.md       expected JSON response shapes
+  troubleshooting.md        fault isolation and recovery
+  release-checklist.md      pre-publication and release validation
+.github/workflows/build.yml secret-free reproducible compile check
+CHANGELOG.md                release history
+```
+
+## Release status and limitations
+
+The reference hardware is operational and the current firmware compiles with
+the pinned toolchain above. Before relying on an adapted build:
+
+- perform a cold-start and overnight soak test;
+- test Wi-Fi and upstream outages;
+- validate brightness in both direct daylight and complete darkness;
+- confirm the alert source and regional assumptions for the installation;
+- verify panel power and temperature at maximum intended brightness.
+
+This is a safety-adjacent information display, not a certified emergency
+warning device. Do not use it as the sole source of civil-defense alerts or
+aviation information.
+
+## License
+
+No open-source license has been selected yet. Copyright therefore remains with
+the author and public visibility alone does not grant reuse rights. Choose and
+add a `LICENSE` file before inviting redistribution or contributions.
+
+## Third-party software and services
+
+This project builds on:
+
+- [Espressif Arduino-ESP32](https://github.com/espressif/arduino-esp32)
+- [ESP32-HUB75-MatrixPanel-DMA](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA)
+- [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
+- [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library)
+- [Open-Meteo](https://open-meteo.com/) for current and daily weather data
+
+Their licenses and service terms apply independently. The default aircraft and
+alert endpoints are deployment-specific public services, not bundled server
+components; confirm availability and permission before redistributing an
+adapted configuration.
+
+## Further documentation
+
+- [Hardware pinout](docs/hardware-pinout.md)
+- [Runtime architecture](docs/runtime-architecture.md)
+- [API observations](docs/api-observations.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Release checklist](docs/release-checklist.md)
+- [Changelog](CHANGELOG.md)
