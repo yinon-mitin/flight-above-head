@@ -9,6 +9,7 @@ SKETCH = ROOT / "FlightAboveHead.ino"
 PINOUT = ROOT / "docs" / "hardware-pinout.md"
 GUIDE = ROOT / "docs" / "experience-guide.md"
 BUILD_GUIDE = ROOT / "docs" / "build-and-deploy.md"
+PROVIDER_GUIDE = ROOT / "docs" / "data-providers.md"
 
 
 class PublicDocumentationTests(unittest.TestCase):
@@ -41,6 +42,20 @@ class PublicDocumentationTests(unittest.TestCase):
         for constant, (label, pin) in expected.items():
             self.assertIn(f"{constant} = {pin}", sketch)
             self.assertIn(f"| {label} | {pin} |", pinout)
+
+    def test_public_repository_excludes_internal_migration_notes(self) -> None:
+        self.assertFalse((ROOT / "docs" / "source-inventory.md").exists())
+        self.assertFalse((ROOT / "docs" / "mvp-plan.md").exists())
+
+    def test_data_provider_guide_discloses_the_runtime_boundary(self) -> None:
+        guide = PROVIDER_GUIDE.read_text()
+        for phrase in (
+            "core runtime dependency",
+            "not included in this repository",
+            "non-commercial",
+            "roshpinaoverhead.online",
+        ):
+            self.assertIn(phrase, guide)
 
     def test_build_guide_has_the_canonical_secret_free_compile_recipe(self) -> None:
         build_guide = BUILD_GUIDE.read_text()

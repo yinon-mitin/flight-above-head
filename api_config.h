@@ -1,6 +1,8 @@
 #pragma once
 
-// Public AirPlaneTracker service: current flights and persisted history.
+// Configured external provider service: current flights and persisted history.
+// The service implementation and its upstream data-source rights are outside
+// this firmware repository; see docs/data-providers.md.
 #define FLIGHTS_API_URL "https://roshpinaoverhead.online/api/flights"
 #define HISTORY_API_URL "https://roshpinaoverhead.online/api/flights/history"
 
