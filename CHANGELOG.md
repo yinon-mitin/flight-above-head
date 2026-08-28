@@ -6,6 +6,9 @@ All notable changes to Flight Above Head are documented here.
 
 ### Added
 
+- Added an experience guide for the public project page: all 14 ambient scenes,
+  live screens, controls, automatic DAY/NIGHT/SLEEP behavior, and 24/7 design.
+- Added a canonical Arduino IDE/CLI build-and-deploy guide.
 - Added a new interior-display project mark that depicts ambient screensavers,
   live aircraft, and rocket-alert priority.
 - Adopted Apache License 2.0 with a redistribution NOTICE that credits Yinon

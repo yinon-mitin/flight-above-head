@@ -1,175 +1,108 @@
 <p align="center">
-  <img src="assets/flight-above-head-mark.svg" alt="Flight Above Head — ESP32-S3 HUB75 live airspace display" width="860">
+  <img src="assets/flight-above-head-mark.svg" alt="Flight Above Head — an ambient interior display for aircraft and alerts" width="920">
 </p>
 
 <p align="center">
   <a href="https://github.com/yinon-mitin/flight-above-head/actions/workflows/build.yml"><img src="https://github.com/yinon-mitin/flight-above-head/actions/workflows/build.yml/badge.svg?branch=main" alt="Arduino build"></a>
   <img src="https://img.shields.io/badge/target-ESP32--S3-0b6bcb?logo=espressif&logoColor=white" alt="ESP32-S3 target">
+  <img src="https://img.shields.io/badge/display-128×64%20HUB75E-ffb547" alt="128 by 64 HUB75E display">
   <img src="https://img.shields.io/badge/Arduino--ESP32-3.3.11-00979d?logo=arduino&logoColor=white" alt="Arduino ESP32 3.3.11">
-  <img src="https://img.shields.io/badge/display-HUB75E-ffb547" alt="HUB75E display">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-6b4fbb" alt="Apache-2.0 license"></a>
 </p>
 
-<p align="center"><strong>A decorative interior display with ambient scenes, live overhead aircraft, Israeli rocket alerts, weather, and time on a 128×64 HUB75E panel.</strong></p>
+<p align="center"><strong>A decorative LED object that spends its day as art — then becomes a live aircraft and alert display when the sky changes.</strong></p>
 
-Flight Above Head is an ESP32-S3 firmware project for a fixed installation. Most of the time it behaves as a calm ambient object with changeable screensavers; when an aircraft or regional rocket alert appears, the live signal takes priority. Private Wi-Fi credentials and coordinates stay outside Git.
+Most of the time, Flight Above Head is simply a beautiful part of a room: a
+radar sweep, a slow lava lamp, a wave that follows daylight, stars, clocks, or
+a calm forecast. When a flight passes overhead, an animated aircraft card takes
+the panel. When a regional rocket alert is active, it takes priority over
+everything.
 
-> This is a safety-adjacent information display, not a certified emergency-warning device. Do not rely on it as the sole source of civil-defense or aviation information.
+<p align="center"><a href="docs/experience-guide.md"><strong>Explore what the panel can do →</strong></a></p>
 
-## Highlights
+> Flight Above Head is an informational display, not a certified emergency-warning device. Keep independent official alert channels available.
 
-| Capability | Behavior |
+## Why build one?
+
+| It feels like | It actually does |
 | --- | --- |
-| Live airspace | Polls the configured AirPlaneTracker service and prioritizes a current aircraft card. |
-| Israeli rocket alerts | Regional alert state always overrides aircraft and selected UI screens. |
-| Ambient display | Includes time, weather, forecast, daylight-aware themes, fourteen screensavers, and BH1750 brightness control. |
-| Resilience | Retains last-good data, bounded retries, diagnostics, reset recovery, and a blank cold-start panel. |
-| Privacy boundary | Real `secrets.h` and `location.h` are ignored; tracked `.example` templates document the required format. |
-| Repeatable CI | GitHub Actions compiles a secret-free ESP32-S3 build on every push and pull request. |
+| A changing piece of interior art | Choose from fourteen ambient scenes: radar, fire, wave, lava, clocks, stars, geometry, weather, and more. |
+| A screen that notices the room | Uses daylight, sunset, and optional ambient-light sensing to shift through DAY, NIGHT, and near-dark SLEEP behavior. |
+| A live window onto the sky | Transitions into a current overhead-aircraft view and keeps the latest aircraft available afterward. |
+| A quietly capable appliance | Handles regional rocket alerts, automatic brightness, retained data during short outages, reset recovery, and diagnostics. |
+| A project worth making your own | Open under Apache-2.0, with safe configuration templates and a reproducible secret-free CI build. |
 
-## Architecture
+## The experience
 
 ```mermaid
 flowchart LR
-  APIs[Flight · Alert · Open-Meteo APIs] --> NET[Network task · Core 0]
-  Sensor[BH1750 + touch button] --> LOOP[Arduino loop]
-  NET --> STATE[Mutex-protected shared state]
-  LOOP --> STATE
-  STATE --> RENDER[Render task · Core 1]
-  RENDER --> PANEL[128×64 HUB75E panel]
+  A[Ambient scene] --> B{Something changes?}
+  B -->|Aircraft overhead| C[Animated flight card]
+  B -->|Regional rocket alert| D[High-priority alert]
+  B -->|Room gets dark| E[Warm NIGHT → low-light SLEEP]
+  C --> A
+  D --> A
+  E --> A
 ```
 
-Detailed task ownership, render cadence, failure handling, and state priority: [runtime architecture](docs/runtime-architecture.md).
+The firmware keeps the magic simple at the surface: the panel owns the room,
+not a dashboard. Details of the effects, screen priority, automatic modes,
+controls, and continuous-operation design are in the [experience guide](docs/experience-guide.md).
 
-## Quick start
+## Build yours
 
-### 1. Hardware and software
+### What you need
 
-The reference build targets an **ESP32-S3-N16R8 / HW-678** with OPI PSRAM, a 128×64 HUB75E panel, a TTP223-style touch module, and an optional BH1750 light sensor.
+- ESP32-S3 with OPI PSRAM (the reference board is an ESP32-S3-N16R8 / HW-678);
+- 128×64 HUB75E panel and an appropriately sized fused 5 V supply;
+- TTP223-style touch module; optional BH1750 ambient-light sensor;
+- Arduino IDE 2.x or Arduino CLI.
 
-Install:
+The complete shopping, wiring, power, and safety detail is in the [hardware guide](docs/hardware-pinout.md).
 
-- Arduino IDE 2.x or Arduino CLI;
-- Espressif Arduino-ESP32 core `3.3.11`;
-- `ESP32 HUB75 LED MATRIX PANEL DMA Display@3.0.14`;
-- `ArduinoJson@7.4.3`;
-- `Adafruit GFX Library@1.12.6`.
-
-See the complete [pinout and power guidance](docs/hardware-pinout.md) before connecting a panel.
-
-### 2. Add local configuration
+### Give it a home
 
 ```bash
+git clone https://github.com/yinon-mitin/flight-above-head.git FlightAboveHead
+cd FlightAboveHead
+
 cp secrets.example.h secrets.h
 cp location.example.h location.h
 ```
 
-Edit only the copied files. They are ignored by Git:
+Fill in Wi-Fi and installation coordinates only in those copied files. They are
+ignored by Git. A build without `location.h` is valid, but leaves weather and
+solar features disabled.
 
-```cpp
-// secrets.h
-constexpr const char *WIFI_SSID = "your-wifi-ssid";
-constexpr const char *WIFI_PASSWORD = "your-wifi-password";
+### Make it light up
 
-// location.h
-#define HOME_LATITUDE 00.000000
-#define HOME_LONGITUDE 00.000000
-```
+1. Open `FlightAboveHead.ino` in Arduino IDE, or follow the [canonical build and deploy guide](docs/build-and-deploy.md).
+2. Select **ESP32S3 Dev Module**, OPI PSRAM, and Hardware CDC/JTAG USB mode.
+3. Upload, power the panel safely, then press the touch button once.
+4. Let it run. Pick a scene with a short touch; ask for `help` over USB Serial whenever you want to explore further.
 
-A build without `location.h` is valid for CI but intentionally disables weather and solar polling. Never commit either local file.
+The first touch deliberately arms the panel after a true cold boot. From then
+on it looks after its own day/night behavior and recovers the armed panel after
+software, watchdog, brownout, and reset-button restarts.
 
-### 3. Build
+## Go deeper when you want to
 
-Arduino CLI:
+- [What the panel can do](docs/experience-guide.md) — all scenes, live screens, controls, automatic modes, and 24/7 design.
+- [Build and deploy](docs/build-and-deploy.md) — exact Arduino IDE and Arduino CLI recipe.
+- [Hardware pinout and electrical safety](docs/hardware-pinout.md) — exact GPIO map, power, color order, and panel wiring.
+- [Runtime architecture](docs/runtime-architecture.md) — render pipeline, transitions, resilience, and diagnostics.
+- [Troubleshooting](docs/troubleshooting.md) — upload, PSRAM, flicker, touch, Wi-Fi, and reset recovery.
+- [Release checklist](docs/release-checklist.md) — privacy, validation, soak-test, and publishing checks.
 
-```bash
-arduino-cli core install esp32:esp32@3.3.11
-arduino-cli lib install "ESP32 HUB75 LED MATRIX PANEL DMA Display@3.0.14"
-arduino-cli lib install "ArduinoJson@7.4.3"
-arduino-cli lib install "Adafruit GFX Library@1.12.6"
+## Make it your own
 
-# Arduino requires its sketch directory to match FlightAboveHead.ino.
-# Clone or place the repository in a directory named FlightAboveHead.
-arduino-cli compile \
-  --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,USBMode=hwcdc,CDCOnBoot=cdc' \
-  /path/to/FlightAboveHead
-```
+Flight Above Head is a fast starting point for your own ambient display, local
+sky project, or living-space information object. Fork it, reshape the visuals,
+adapt the data sources, and share what you build.
 
-For Arduino IDE settings, USB upload recovery, and the full deployment sequence, see [troubleshooting](docs/troubleshooting.md) and [hardware pinout](docs/hardware-pinout.md).
+The project is licensed under [Apache License 2.0](LICENSE). When redistributing
+the work or a derivative, retain the attribution in [NOTICE](NOTICE), which
+credits [Yinon Mitin](https://github.com/yinon-mitin) and links to the original
+[Flight Above Head project](https://github.com/yinon-mitin/flight-above-head).
 
-### 4. First boot
-
-1. Power the controller and panel with a stable supply and common ground.
-2. The firmware starts network, time, APIs, sensor, and touch input while leaving HUB75 electrically blank.
-3. Press the touch button once, or send `panel on`, to initialize the display. That first touch is intentionally consumed.
-4. Open Serial Monitor at `115200` baud and confirm `[display] ready`, Wi-Fi, NTP, and the expected GPIO map.
-
-## Operate it
-
-| Gesture / command | Result |
-| --- | --- |
-| First touch after a cold power-on | Initializes the HUB75 display. |
-| Short touch | Enters or advances screensavers. |
-| Double touch | Opens/closes Last Aircraft; acknowledges the currently visible live aircraft. |
-| Long touch | Toggles automatic BH1750 brightness and manual brightness. |
-| `panel on` / `panel off` | Enables or blanks the panel without stopping background services. |
-| `brightness auto \| fixed \| 0..255` | Selects sensor, default, or exact brightness. |
-| `screen auto \| idle \| last \| aircraft \| test \| saver \| alert` | Selects a test screen; alert and live-aircraft priority remains enforced. |
-| `saver next \| saver 1..14` | Changes the active screensaver. |
-| `night auto \| night on \| night off` | Selects automatic or forced visual mode. |
-| `diag` / `status` | Prints a structured runtime snapshot. |
-
-## Repository map
-
-```text
-FlightAboveHead.ino          Firmware entry point
-api_config.h                 Public endpoint and private-location loader
-build_opt.h                  ESP32 HUB75 DMA build options
-secrets.example.h            Safe Wi-Fi configuration template
-location.example.h           Safe location configuration template
-open_meteo_ca.h              Pinned CA for authenticated Open-Meteo HTTPS
-assets/                      Repository brand assets
-docs/                        Architecture, wiring, API notes, troubleshooting
-tests/                       Host-side regression checks
-.github/workflows/build.yml  Secret-free ESP32-S3 CI compile
-NOTICE                       Required attribution notice for redistributions
-```
-
-## Documentation
-
-- [Hardware pinout and electrical safety](docs/hardware-pinout.md)
-- [Runtime architecture](docs/runtime-architecture.md)
-- [API observations](docs/api-observations.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Release checklist](docs/release-checklist.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-
-## Security and privacy
-
-- Keep `secrets.h` and `location.h` local and untracked.
-- Review Serial logs and photos before sharing: SSIDs, infrastructure URLs, and image metadata can disclose private information.
-- The Open-Meteo request uses HTTPS with certificate verification for the location-bearing call.
-- Before release, run the checks in [docs/release-checklist.md](docs/release-checklist.md).
-
-To report a potential vulnerability privately, follow [SECURITY.md](SECURITY.md). Do not publish credentials or a secret in an issue.
-
-## Contributing
-
-Issues and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), keep the secret-free build green, and never add local configuration files to a commit.
-
-## License
-
-This project is licensed under [Apache License 2.0](LICENSE): you may use,
-modify, and redistribute it, including as a starting point for another project.
-When redistributing the work or a derivative, retain the attribution notice in
-[NOTICE](NOTICE), which credits [Yinon Mitin](https://github.com/yinon-mitin)
-and links to the original [Flight Above Head project](https://github.com/yinon-mitin/flight-above-head).
-
-The project is provided without warranty. Third-party dependencies and services
-retain their own licenses and terms.
-
-## Third-party software and services
-
-This project uses [Espressif Arduino-ESP32](https://github.com/espressif/arduino-esp32), [ESP32-HUB75-MatrixPanel-DMA](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA), [ArduinoJson](https://github.com/bblanchon/ArduinoJson), [Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library), and [Open-Meteo](https://open-meteo.com/). Their licenses and service terms apply independently.
+For contribution and responsible disclosure guidance, see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
