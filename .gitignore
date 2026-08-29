@@ -4,6 +4,7 @@ location.h
 .DS_Store
 logs
 build/
+.venv/
 *.bin
 *.elf
 *.map

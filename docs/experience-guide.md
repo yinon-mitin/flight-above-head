@@ -64,7 +64,9 @@ into a near-dark `SLEEP` state; sustained light or sunrise restores normal
 operation.
 
 - DAY uses normal color and brightness ranges.
-- NIGHT begins at local sunset and uses a warm, lower-brightness palette.
+- NIGHT begins at local sunset and uses a warm, lower-brightness palette. The
+  transition from DAY to NIGHT is eased continuously over 60 seconds, including
+  both the palette and automatic panel brightness.
 - SLEEP begins after 60 continuous seconds at or below 1 lux and exits after
   30 seconds at or above 3 lux, or at sunrise.
 - Alerts retain their high-visibility range even during NIGHT and SLEEP.

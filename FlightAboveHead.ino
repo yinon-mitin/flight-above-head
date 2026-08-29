@@ -135,6 +135,9 @@ constexpr uint32_t BOOT_INTRO_DURATION_MS = 1900;
 constexpr uint32_t AIRCRAFT_TRANSITION_DURATION_MS = 2100;
 constexpr uint32_t AIRCRAFT_TRANSITION_FILL_MS = 240;
 constexpr uint32_t AIRCRAFT_TRANSITION_CUT_MS = 900;
+// Sunset is a visual transition, not a discrete scene cut. Keep the minute
+// long fade independent from the faster ambient animation cadences.
+constexpr uint32_t NIGHT_TRANSITION_DURATION_MS = 60UL * 1000UL;
 
 // Fallback brightness when the sensor is absent.
 constexpr uint8_t IDLE_BRIGHTNESS = 24;
@@ -380,6 +383,7 @@ TaskHandle_t renderTaskHandle = nullptr;
 MatrixPanel_I2S_DMA *dmaDisplay = nullptr;
 volatile bool displayReady = false;
 VisualMode activeVisualMode = VisualMode::DAY;
+float nightTransitionBlend = 0.0f;
 
 uint8_t bh1750Address = BH1750_ADDRESS_LOW;
 bool bh1750Configured = false;
@@ -1109,15 +1113,13 @@ void handleTouchButton(uint32_t nowMs) {
 // Display
 // =========================
 uint16_t color565(uint8_t r, uint8_t g, uint8_t b) {
-  if (activeVisualMode != VisualMode::DAY) {
-    uint16_t warmR = r + g * 35U / 100U + b * 20U / 100U;
-    if (warmR > 255U) warmR = 255U;
-    const uint16_t warmG = g * 65U / 100U + b * 12U / 100U;
-    const uint16_t warmB = b * 18U / 100U;
-    r = static_cast<uint8_t>(warmR);
-    g = static_cast<uint8_t>(warmG);
-    b = static_cast<uint8_t>(warmB);
-  }
+  uint16_t warmR = r + g * 35U / 100U + b * 20U / 100U;
+  if (warmR > 255U) warmR = 255U;
+  const uint16_t warmG = g * 65U / 100U + b * 12U / 100U;
+  const uint16_t warmB = b * 18U / 100U;
+  r = static_cast<uint8_t>(roundf(r + (warmR - r) * nightTransitionBlend));
+  g = static_cast<uint8_t>(roundf(g + (warmG - g) * nightTransitionBlend));
+  b = static_cast<uint8_t>(roundf(b + (warmB - b) * nightTransitionBlend));
   switch (PANEL_COLOR_ORDER) {
     case PanelColorOrder::BRG:
       // Feed desired B,R,G into the driver's R,G,B inputs.
@@ -4575,6 +4577,8 @@ void renderTask(void *parameter) {
   AppState previousAppState = AppState::IDLE;
   bool aircraftTransitionActive = false;
   uint32_t aircraftTransitionStartedMs = 0;
+  uint32_t nightTransitionStartedMs = 0;
+  uint8_t nightTransitionBrightnessFrom = IDLE_BRIGHTNESS;
   uint32_t lastDisplayInitAttemptMs = 0;
 
   for (;;) {
@@ -4627,6 +4631,22 @@ void renderTask(void *parameter) {
         bootIntroActive ? AppState::SCREENSAVER : appState;
     const VisualMode visualMode =
         determineVisualMode(snapshot, nowMs);
+    const bool targetIsNight =
+        visualMode == VisualMode::NIGHT || visualMode == VisualMode::SLEEP;
+    const bool blendIsNight = nightTransitionBlend >= 0.5f;
+    if (targetIsNight != blendIsNight) {
+      nightTransitionBrightnessFrom = appliedBrightness;
+      nightTransitionStartedMs = nowMs;
+    }
+    if (nightTransitionStartedMs != 0) {
+      const float progress = constrain(
+          (nowMs - nightTransitionStartedMs) /
+              static_cast<float>(NIGHT_TRANSITION_DURATION_MS),
+          0.0f,
+          1.0f);
+      nightTransitionBlend = targetIsNight ? progress : 1.0f - progress;
+      if (progress >= 1.0f) nightTransitionStartedMs = 0;
+    }
     const bool warmState =
         bootIntroActive ||
         appState == AppState::IDLE ||
@@ -4635,7 +4655,7 @@ void renderTask(void *parameter) {
         appState == AppState::SCREENSAVER;
     const VisualMode renderTheme =
         warmState ? visualMode : VisualMode::DAY;
-    if (renderTheme != activeVisualMode) {
+    if (renderTheme != activeVisualMode || nightTransitionStartedMs != 0) {
       activeVisualMode = renderTheme;
       initColors();
       displayedSignature = 0;
@@ -4654,6 +4674,16 @@ void renderTask(void *parameter) {
     uint8_t nextBrightness = appliedBrightness;
     if (!snapshot.peripheral.panelEnabled) {
       nextBrightness = 0;
+    } else if (nightTransitionStartedMs != 0 &&
+        visualMode != brightnessMode) {
+      const float progress = constrain(
+          (nowMs - nightTransitionStartedMs) /
+              static_cast<float>(NIGHT_TRANSITION_DURATION_MS),
+          0.0f,
+          1.0f);
+      nextBrightness = static_cast<uint8_t>(roundf(
+          nightTransitionBrightnessFrom +
+          (targetBrightness - nightTransitionBrightnessFrom) * progress));
     } else if (brightnessAppState != brightnessState ||
         visualMode != brightnessMode ||
         snapshot.peripheral.manualBrightnessEnabled ||
